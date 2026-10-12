@@ -19,8 +19,9 @@ CpuPcg::CpuPcg(const Model3D& m, Precond pc)
             L.ny = g.ny;
             L.dx = to_real(g.dx);
             L.dy = to_real(g.dy);
-            L.x.assign((size_t)g.nx * g.ny * m.nz, 0);
-            L.b.assign((size_t)g.nx * g.ny * m.nz, 0);
+            L.icx = to_real(g.icx);
+            L.icy = to_real(g.icy);
+            for (auto* v : {&L.x, &L.b, &L.fcp, &L.finv}) v->assign((size_t)g.nx * g.ny * m.nz, 0);
             levels_.push_back(std::move(L));
         }
     set_shift(std::vector<double>(m.nz, 0.0));
@@ -38,6 +39,15 @@ void CpuPcg::set_shift(const std::vector<double>& shift) {
     gzu_a_ = to_real(c.gzu_a);
     gzd_a_ = to_real(c.gzd_a);
     shift_a_ = to_real(c.shift_a);
+
+    // Multigrid column factors for every level.
+    const MgPlanes<Real> p{kdz_.data(), gzu_a_.data(), gzd_a_.data(), shift_a_.data(), m_.nz};
+    for (Level& L : levels_) {
+        const MgGrid<Real> g{L.nx, L.ny, L.dx.data(), L.dy.data(), L.icx.data(),
+                             L.icy.data(), nullptr, nullptr};
+        for (int j = 0; j < L.ny; ++j)
+            for (int i = 0; i < L.nx; ++i) mg_factor_column(g, p, L.fcp.data(), L.finv.data(), i, j);
+    }
 }
 
 void CpuPcg::set_x_zero() { std::fill(x_.begin(), x_.end(), Real(0)); }
@@ -57,7 +67,8 @@ void CpuPcg::set_rhs_transient() {
 void CpuPcg::vcycle(size_t k) {
     Level& L = levels_[k];
     std::fill(L.x.begin(), L.x.end(), Real(0));
-    const MgGrid<Real> g{L.nx, L.ny, L.dx.data(), L.dy.data()};
+    const MgGrid<Real> g{L.nx, L.ny, L.dx.data(), L.dy.data(), L.icx.data(),
+                         L.icy.data(), L.fcp.data(), L.finv.data()};
     const MgPlanes<Real> p{kdz_.data(), gzu_a_.data(), gzd_a_.data(), shift_a_.data(), m_.nz};
     auto sweep = [&](int color) {  // red-black: columns with (i + j) % 2 == color
         for (int j = 0; j < L.ny; ++j)

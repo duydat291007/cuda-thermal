@@ -54,6 +54,13 @@ from the stack's physics:
 - coarse operators are rebuilt from the coarse cell sizes (odd sizes allowed), and
   restriction is the transpose of prolongation, so the V-cycle stays symmetric.
 
+Profiling (Nsight Systems, 800 x 800) showed the smoother taking ~6.6 ms per
+pass, ~10x its memory-bandwidth limit: it did ~6 FP64 divisions per cell (FP64
+runs at 1/64 speed on GeForce) and half its threads idled in red-black order. Now
+the conductances and each column's tridiagonal factors are precomputed per level
+whenever the time step changes, the smoother only multiplies, and threads are
+launched only for the active color.
+
 **Precision:** the solver runs in double. Neighboring cells in the thin silicon
 layers differ by ~1e-5 K while T is ~50 K, only a few float ulps apart. In float,
 PCG's tracked residual reaches 1e-6 while the true residual stays at 1e-3 (64 x 64)

@@ -20,7 +20,13 @@
 //    copies each coarse value to its children. The two are transposes of each
 //    other, and the smoothing is symmetric (red, black before; black, red
 //    after), so the V-cycle is a symmetric preconditioner, as CG requires.
+//
+// Performance: everything that depends only on geometry and the time step is
+// precomputed per level (mg_factor_column), so the smoother does no divisions.
+// FP64 division is very slow on GeForce GPUs; computing it on the fly made the
+// smoother ~10x slower than its memory traffic allows.
 #pragma once
+#include <algorithm>
 #include <vector>
 #include "operator3d.h"
 #include "stack3d.h"
@@ -35,22 +41,35 @@ struct MgPlanes {
     int nz;
 };
 
-// Lateral geometry of one level: cell widths dx[i] (size nx) and dy[j] (size ny).
+// One level: cell widths dx[i] (size nx), dy[j] (size ny); inverse distances
+// between neighboring cell centers icx[i] = 1 / ((dx[i] + dx[i+1]) / 2) (size
+// nx - 1) and icy[j]; and the precomputed column factors (see mg_factor_column).
 template <class R>
 struct MgGrid {
     int nx, ny;
-    const R* dx;
-    const R* dy;
+    const R *dx, *dy, *icx, *icy;
+    const R *fcp, *finv;  // per cell: Thomas upper factor, 1 / pivot
 };
 
 // Lateral conductances: between columns i and i+1 (gx), and j and j+1 (gy).
 template <class R>
 HD inline R mg_gx(const MgGrid<R>& g, R kdz, int i, int j) {
-    return kdz * g.dy[j] / (R(0.5) * (g.dx[i] + g.dx[i + 1]));
+    return kdz * g.dy[j] * g.icx[i];
 }
 template <class R>
 HD inline R mg_gy(const MgGrid<R>& g, R kdz, int i, int j) {
-    return kdz * g.dx[i] / (R(0.5) * (g.dy[j] + g.dy[j + 1]));
+    return kdz * g.dx[i] * g.icy[j];
+}
+
+// Sum of the lateral conductances of column (i, j) in a plane with this kdz.
+template <class R>
+HD inline R mg_lateral_diag(const MgGrid<R>& g, R kdz, int i, int j) {
+    R d = 0;
+    if (i > 0) d += mg_gx(g, kdz, i - 1, j);
+    if (i < g.nx - 1) d += mg_gx(g, kdz, i, j);
+    if (j > 0) d += mg_gy(g, kdz, i, j - 1);
+    if (j < g.ny - 1) d += mg_gy(g, kdz, i, j);
+    return d;
 }
 
 // Lateral part of row (i, j, l): adds the lateral conductances to d and the
@@ -79,29 +98,51 @@ HD inline R mg_apply(const MgGrid<R>& g, const MgPlanes<R>& p, const R* x, int i
     return d * x[id] - s;
 }
 
+// Factors the tridiagonal matrix of column (i, j) once (Thomas algorithm):
+// fcp = modified upper diagonal, finv = 1 / pivot. They depend only on geometry
+// and the shift, so they are recomputed only when the time step changes.
+template <class R>
+HD inline void mg_factor_column(const MgGrid<R>& g, const MgPlanes<R>& p, R* fcp, R* finv,
+                                int i, int j) {
+    const size_t sxy = (size_t)g.nx * g.ny;
+    const size_t col = (size_t)j * g.nx + i;
+    const R area = g.dx[i] * g.dy[j];
+    R cp_prev = 0;
+    for (int l = 0; l < p.nz; ++l) {
+        const size_t id = (size_t)l * sxy + col;
+        const R d = (p.gzd_a[l] + p.gzu_a[l] + p.shift_a[l]) * area +
+                    mg_lateral_diag(g, p.kdz[l], i, j);
+        const R lower = (l > 0) ? -p.gzd_a[l] * area : R(0);
+        const R upper = (l < p.nz - 1) ? -p.gzu_a[l] * area : R(0);
+        const R inv = R(1) / (d - lower * cp_prev);
+        finv[id] = inv;
+        cp_prev = upper * inv;
+        fcp[id] = cp_prev;
+    }
+}
+
 // Solves column (i, j) exactly for x, holding the neighboring columns fixed:
-// a tridiagonal system in z, solved with the Thomas algorithm.
+// a tridiagonal system in z, using the precomputed factors. The forward pass
+// writes its intermediate values straight into x, then the back substitution
+// finishes in place, so no scratch arrays and no divisions are needed.
 template <class R>
 HD inline void mg_line_solve(const MgGrid<R>& g, const MgPlanes<R>& p, const R* b, R* x,
                              int i, int j) {
     const size_t sxy = (size_t)g.nx * g.ny;
     const size_t col = (size_t)j * g.nx + i;
     const R area = g.dx[i] * g.dy[j];
-    R cp[MAXZ], dp[MAXZ];  // modified upper diagonal and right-hand side
+    R prev = 0;
     for (int l = 0; l < p.nz; ++l) {
         const size_t id = (size_t)l * sxy + col;
-        R d = (p.gzd_a[l] + p.gzu_a[l] + p.shift_a[l]) * area, s = b[id];
+        R d = 0, s = b[id];  // d is not needed: the pivots are precomputed
         mg_lateral(g, p.kdz[l], x, id, i, j, d, s);
         const R lower = (l > 0) ? -p.gzd_a[l] * area : R(0);
-        const R upper = (l < p.nz - 1) ? -p.gzu_a[l] * area : R(0);
-        const R den = d - (l > 0 ? lower * cp[l - 1] : R(0));
-        cp[l] = upper / den;
-        dp[l] = (s - (l > 0 ? lower * dp[l - 1] : R(0))) / den;
+        prev = (s - lower * prev) * g.finv[id];
+        x[id] = prev;
     }
-    R above = 0;
-    for (int l = p.nz - 1; l >= 0; --l) {
-        above = dp[l] - (l < p.nz - 1 ? cp[l] * above : R(0));
-        x[(size_t)l * sxy + col] = above;
+    for (int l = p.nz - 2; l >= 0; --l) {
+        const size_t id = (size_t)l * sxy + col;
+        x[id] -= g.fcp[id] * x[id + sxy];
     }
 }
 
@@ -109,7 +150,14 @@ HD inline void mg_line_solve(const MgGrid<R>& g, const MgPlanes<R>& p, const R* 
 struct MgLevelGeom {
     int nx, ny;
     std::vector<double> dx, dy;
+    std::vector<double> icx, icy;  // inverse center distances (at least 1 entry)
 };
+
+inline std::vector<double> inverse_center_distances(const std::vector<double>& w) {
+    std::vector<double> ic(std::max<size_t>(w.size(), 2) - 1, 0.0);
+    for (size_t i = 0; i + 1 < w.size(); ++i) ic[i] = 1.0 / (0.5 * (w[i] + w[i + 1]));
+    return ic;
+}
 
 inline std::vector<MgLevelGeom> mg_hierarchy(const Model3D& m) {
     std::vector<MgLevelGeom> L(1);
@@ -127,6 +175,10 @@ inline std::vector<MgLevelGeom> mg_hierarchy(const Model3D& m) {
         for (int J = 0; J < c.ny; ++J)
             c.dy.push_back(f.dy[2 * J] + (2 * J + 1 < f.ny ? f.dy[2 * J + 1] : 0.0));
         L.push_back(c);
+    }
+    for (MgLevelGeom& g : L) {
+        g.icx = inverse_center_distances(g.dx);
+        g.icy = inverse_center_distances(g.dy);
     }
     return L;
 }

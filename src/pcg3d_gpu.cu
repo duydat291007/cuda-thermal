@@ -200,12 +200,23 @@ __device__ __forceinline__ MgPlanes<Real> mg_planes_dev(int nz) {
 }
 
 // Red-black line smoother: solves every column with (i + j) % 2 == color.
+// Threads are launched only for that color (x index t covers every other
+// column), so no thread sits idle.
 __global__ void k_mg_sweep(MgGrid<Real> g, const Real* __restrict__ b, Real* x, int nz,
                            int color) {
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int i = 2 * t + ((j + color) & 1);
+    if (i >= g.nx || j >= g.ny) return;
+    mg_line_solve(g, mg_planes_dev(nz), b, x, i, j);
+}
+
+// Column factors for every column of a level.
+__global__ void k_mg_factor(MgGrid<Real> g, Real* fcp, Real* finv, int nz) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
-    if (i >= g.nx || j >= g.ny || ((i + j) & 1) != color) return;
-    mg_line_solve(g, mg_planes_dev(nz), b, x, i, j);
+    if (i >= g.nx || j >= g.ny) return;
+    mg_factor_column(g, mg_planes_dev(nz), fcp, finv, i, j);
 }
 
 // Coarse b = sum over the (up to 4) children of the fine residual b - A x.
@@ -259,16 +270,23 @@ GpuPcg::GpuPcg(const Model3D& m, Precond pc) : m_(m), pc_(pc), n_(m.ncells()) {
             Level L;
             L.nx = g.nx;
             L.ny = g.ny;
-            std::vector<Real> dx = to_real(g.dx), dy = to_real(g.dy);
-            CUDA_CHECK(cudaMalloc(&L.dx, dx.size() * sizeof(Real)));
-            CUDA_CHECK(cudaMalloc(&L.dy, dy.size() * sizeof(Real)));
-            CUDA_CHECK(cudaMemcpy(L.dx, dx.data(), dx.size() * sizeof(Real), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(L.dy, dy.data(), dy.size() * sizeof(Real), cudaMemcpyHostToDevice));
+            auto upload = [](const std::vector<double>& v, Real** dst) {
+                std::vector<Real> h = to_real(v);
+                CUDA_CHECK(cudaMalloc(dst, h.size() * sizeof(Real)));
+                CUDA_CHECK(cudaMemcpy(*dst, h.data(), h.size() * sizeof(Real),
+                                      cudaMemcpyHostToDevice));
+            };
+            upload(g.dx, &L.dx);
+            upload(g.dy, &L.dy);
+            upload(g.icx, &L.icx);
+            upload(g.icy, &L.icy);
+            const size_t lb = (size_t)g.nx * g.ny * m.nz * sizeof(Real);
+            CUDA_CHECK(cudaMalloc(&L.fcp, lb));
+            CUDA_CHECK(cudaMalloc(&L.finv, lb));
             if (levels_.empty()) {   // finest level works directly on PCG's r and z
                 L.b = r_;
                 L.x = z_;
             } else {
-                size_t lb = (size_t)g.nx * g.ny * m.nz * sizeof(Real);
                 CUDA_CHECK(cudaMalloc(&L.b, lb));
                 CUDA_CHECK(cudaMalloc(&L.x, lb));
             }
@@ -286,8 +304,9 @@ GpuPcg::~GpuPcg() {
     for (Real* ptr : {P_, x_, b_, r_, z_, p_, Ap_, invd_}) cudaFree(ptr);
     cudaFree(dots_);
     for (size_t k = 0; k < levels_.size(); ++k) {
-        cudaFree(levels_[k].dx);
-        cudaFree(levels_[k].dy);
+        for (Real* ptr : {levels_[k].dx, levels_[k].dy, levels_[k].icx, levels_[k].icy,
+                          levels_[k].fcp, levels_[k].finv})
+            cudaFree(ptr);
         if (k > 0) {  // level 0 borrows r_ and z_
             cudaFree(levels_[k].b);
             cudaFree(levels_[k].x);
@@ -314,6 +333,11 @@ void GpuPcg::set_shift(const std::vector<double>& shift) {
     CUDA_CHECK(cudaMemcpyToSymbol(c_pp, &pp, sizeof(pp)));
     k_invdiag<<<stencil_grid(m_), stencil_block()>>>(invd_, m_.nx, m_.ny);
     KERNEL_CHECK();
+    for (const Level& L : levels_) {  // multigrid column factors
+        const MgGrid<Real> g{L.nx, L.ny, L.dx, L.dy, L.icx, L.icy, nullptr, nullptr};
+        k_mg_factor<<<grid2d(L.nx, L.ny, 1), stencil_block()>>>(g, L.fcp, L.finv, m_.nz);
+        KERNEL_CHECK();
+    }
 }
 
 void GpuPcg::set_x_zero() { CUDA_CHECK(cudaMemset(x_, 0, n_ * sizeof(Real))); }
@@ -337,8 +361,9 @@ void GpuPcg::get_x(std::vector<Real>& T) const {
 void GpuPcg::vcycle(size_t k) {
     const Level& L = levels_[k];
     const int nz = m_.nz;
-    const MgGrid<Real> g{L.nx, L.ny, L.dx, L.dy};
-    const dim3 blk = stencil_block(), g2 = grid2d(L.nx, L.ny, 1);
+    const MgGrid<Real> g{L.nx, L.ny, L.dx, L.dy, L.icx, L.icy, L.fcp, L.finv};
+    const dim3 blk = stencil_block();
+    const dim3 g2 = grid2d((L.nx + 1) / 2, L.ny, 1);  // sweeps: one thread per same-color column
     CUDA_CHECK(cudaMemset(L.x, 0, (size_t)L.nx * L.ny * nz * sizeof(Real)));
 
     if (k + 1 == levels_.size()) {  // a single column: one line solve is exact

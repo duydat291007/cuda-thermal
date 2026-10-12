@@ -68,7 +68,9 @@ private:
 
     struct Level {
         int nx, ny;
-        std::vector<Real> dx, dy, x, b;
+        std::vector<Real> dx, dy, icx, icy;  // geometry
+        std::vector<Real> fcp, finv;         // column factors (depend on the shift)
+        std::vector<Real> x, b;
     };
 
     const Model3D& m_;
@@ -98,8 +100,9 @@ private:
 
     struct Level {
         int nx, ny;
-        Real *dx = nullptr, *dy = nullptr;  // cell widths (device)
-        Real *x = nullptr, *b = nullptr;    // level 0 points at the PCG's z and r
+        Real *dx = nullptr, *dy = nullptr, *icx = nullptr, *icy = nullptr;  // geometry
+        Real *fcp = nullptr, *finv = nullptr;  // column factors (depend on the shift)
+        Real *x = nullptr, *b = nullptr;       // level 0 points at the PCG's z and r
     };
 
     const Model3D& m_;
