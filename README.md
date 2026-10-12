@@ -59,7 +59,16 @@ pass, ~10x its memory-bandwidth limit: it did ~6 FP64 divisions per cell (FP64
 runs at 1/64 speed on GeForce) and half its threads idled in red-black order. Now
 the conductances and each column's tridiagonal factors are precomputed per level
 whenever the time step changes, the smoother only multiplies, and threads are
-launched only for the active color.
+launched only for the active color. Result: smoother 6.6 -> 1.4 ms per pass,
+800 x 800 steady solve 488 -> 236 ms.
+
+**Mixed precision:** PCG runs in double, the multigrid V-cycle in float. The
+V-cycle only proposes a search direction and PCG measures its effect in double,
+so float rounding in the preconditioner never accumulates in the solution (unlike
+the all-float solver above). Measured on 200-800 grids: identical iteration counts
+down to 1e-10, temperatures equal to 1e-13 K. Float halves the V-cycle's memory
+traffic and runs ~64x faster arithmetic on GeForce. Build with `-DMG_DOUBLE` to
+run the V-cycle in double for comparison.
 
 **Precision:** the solver runs in double. Neighboring cells in the thin silicon
 layers differ by ~1e-5 K while T is ~50 K, only a few float ulps apart. In float,
@@ -108,7 +117,8 @@ cmake --build build --config Release
 3. ~~3D layered stack, steady state, PCG solver in double~~. Jacobi needed
    ~90x more iterations than PCG on this stack, so the implicit solver moved up.
 4. ~~Transient: backward Euler time stepping with PCG~~
-5. ~~Multigrid preconditioner~~ (here). Next for speed: keep PCG scalars on the
-   GPU and batch the many small coarse-level launches (CUDA graphs)
+5. ~~Multigrid preconditioner~~, ~~profiled and optimized~~, ~~float V-cycle in
+   double PCG~~ (here). Next for speed: pinned host memory, keep PCG scalars on
+   the GPU, batch the small coarse-level launches (CUDA graphs)
 6. Power maps from file, TSVs, anisotropic layers
 7. Validate and benchmark against 3D-ICE

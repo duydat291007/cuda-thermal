@@ -10,6 +10,9 @@
 //
 // With the multigrid preconditioner, z = M^-1 r is one V-cycle instead (mg3d.h),
 // so the loop uses unfused kernels: update x and r, run the V-cycle, then r . z.
+// The V-cycle runs in MgReal (float by default) while PCG stays in Real
+// (double); k_update_xr writes a float copy of r for it, and k_from_mg_dot
+// converts its result back while computing r . z.
 //
 // The GpuPcg object keeps every buffer on the GPU between solves, so a transient
 // run only moves the temperature field back to the host when it asks for it.
@@ -24,7 +27,7 @@
 // constant memory serves each read to the whole warp at once.
 struct PlaneParams {
     Real gx[MAXZ], gy[MAXZ], gzd[MAXZ], gzu[MAXZ], shift[MAXZ];  // fine grid, per cell
-    Real kdz[MAXZ], gzu_a[MAXZ], gzd_a[MAXZ], shift_a[MAXZ];     // multigrid, per area
+    MgReal kdz[MAXZ], gzu_a[MAXZ], gzd_a[MAXZ], shift_a[MAXZ];  // multigrid, per area
 };
 __constant__ PlaneParams c_pp;  // one GpuPcg at a time uses this
 
@@ -150,9 +153,10 @@ __global__ void k_update_p(Real beta, const Real* __restrict__ z, Real* p, size_
 
 // ---- kernels used with the multigrid preconditioner ------------------------
 
-// r = b - (A + S) x;  dots[1] += r . r, dots[2] += b . b
+// r = b - (A + S) x, b0 = r in MgReal;  dots[1] += r . r, dots[2] += b . b
 __global__ void k_residual(const Real* __restrict__ b, const Real* __restrict__ x,
-                           Real* __restrict__ r, int nx, int ny, int nz, double* dots) {
+                           Real* __restrict__ r, MgReal* __restrict__ b0, int nx, int ny,
+                           int nz, double* dots) {
     __shared__ double s1[32], s2[32];
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -163,6 +167,7 @@ __global__ void k_residual(const Real* __restrict__ b, const Real* __restrict__ 
         Real bi = b[id];
         Real ri = bi - apply_dev(x, i, j, l, nx, ny, nz);
         r[id] = ri;
+        b0[id] = (MgReal)ri;
         rr = (double)ri * ri;
         bb = (double)bi * bi;
     }
@@ -170,10 +175,10 @@ __global__ void k_residual(const Real* __restrict__ b, const Real* __restrict__ 
     block_sum_to(bb, s2, &dots[2]);
 }
 
-// x += alpha p, r -= alpha Ap;  *rr += r . r
+// x += alpha p, r -= alpha Ap, b0 = r in MgReal;  *rr += r . r
 __global__ void k_update_xr(Real alpha, const Real* __restrict__ p,
-                            const Real* __restrict__ Ap, Real* x, Real* r, size_t n,
-                            double* rr) {
+                            const Real* __restrict__ Ap, Real* x, Real* r,
+                            MgReal* __restrict__ b0, size_t n, double* rr) {
     __shared__ double s[32];
     size_t c = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     double v = 0.0;
@@ -181,28 +186,34 @@ __global__ void k_update_xr(Real alpha, const Real* __restrict__ p,
         x[c] += alpha * p[c];
         Real ri = r[c] - alpha * Ap[c];
         r[c] = ri;
+        b0[c] = (MgReal)ri;
         v = (double)ri * ri;
     }
     block_sum_to(v, s, rr);
 }
 
-// *out += a . b
-__global__ void k_dot(const Real* __restrict__ a, const Real* __restrict__ b, size_t n,
-                      double* out) {
+// z = V-cycle result x0 converted to Real;  *rz += r . z
+__global__ void k_from_mg_dot(const MgReal* __restrict__ x0, const Real* __restrict__ r,
+                              Real* __restrict__ z, size_t n, double* rz) {
     __shared__ double s[32];
     size_t c = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    double v = (c < n) ? (double)a[c] * b[c] : 0.0;
-    block_sum_to(v, s, out);
+    double v = 0.0;
+    if (c < n) {
+        Real zi = (Real)x0[c];
+        z[c] = zi;
+        v = (double)r[c] * zi;
+    }
+    block_sum_to(v, s, rz);
 }
 
-__device__ __forceinline__ MgPlanes<Real> mg_planes_dev(int nz) {
-    return MgPlanes<Real>{c_pp.kdz, c_pp.gzu_a, c_pp.gzd_a, c_pp.shift_a, nz};
+__device__ __forceinline__ MgPlanes<MgReal> mg_planes_dev(int nz) {
+    return MgPlanes<MgReal>{c_pp.kdz, c_pp.gzu_a, c_pp.gzd_a, c_pp.shift_a, nz};
 }
 
 // Red-black line smoother: solves every column with (i + j) % 2 == color.
 // Threads are launched only for that color (x index t covers every other
 // column), so no thread sits idle.
-__global__ void k_mg_sweep(MgGrid<Real> g, const Real* __restrict__ b, Real* x, int nz,
+__global__ void k_mg_sweep(MgGrid<MgReal> g, const MgReal* __restrict__ b, MgReal* x, int nz,
                            int color) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -212,7 +223,7 @@ __global__ void k_mg_sweep(MgGrid<Real> g, const Real* __restrict__ b, Real* x, 
 }
 
 // Column factors for every column of a level.
-__global__ void k_mg_factor(MgGrid<Real> g, Real* fcp, Real* finv, int nz) {
+__global__ void k_mg_factor(MgGrid<MgReal> g, MgReal* fcp, MgReal* finv, int nz) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= g.nx || j >= g.ny) return;
@@ -221,16 +232,16 @@ __global__ void k_mg_factor(MgGrid<Real> g, Real* fcp, Real* finv, int nz) {
 
 // Coarse b = sum over the (up to 4) children of the fine residual b - A x.
 // One thread per coarse cell, so the sum has a fixed order (no atomics).
-__global__ void k_mg_restrict(MgGrid<Real> f, const Real* __restrict__ fb,
-                              const Real* __restrict__ fx, int cnx, int cny,
-                              Real* __restrict__ cb, int nz) {
+__global__ void k_mg_restrict(MgGrid<MgReal> f, const MgReal* __restrict__ fb,
+                              const MgReal* __restrict__ fx, int cnx, int cny,
+                              MgReal* __restrict__ cb, int nz) {
     int I = blockIdx.x * blockDim.x + threadIdx.x;
     int J = blockIdx.y * blockDim.y + threadIdx.y;
     int l = blockIdx.z;
     if (I >= cnx || J >= cny) return;
-    const MgPlanes<Real> p = mg_planes_dev(nz);
+    const MgPlanes<MgReal> p = mg_planes_dev(nz);
     const size_t fxy = (size_t)f.nx * f.ny;
-    Real sum = 0;
+    MgReal sum = 0;
     for (int j = 2 * J; j < min(2 * J + 2, f.ny); ++j)
         for (int i = 2 * I; i < min(2 * I + 2, f.nx); ++i) {
             size_t id = (size_t)l * fxy + (size_t)j * f.nx + i;
@@ -240,8 +251,8 @@ __global__ void k_mg_restrict(MgGrid<Real> f, const Real* __restrict__ fb,
 }
 
 // Fine x += coarse x of the parent cell.
-__global__ void k_mg_prolong(int fnx, int fny, Real* fx, int cnx, int cny,
-                             const Real* __restrict__ cx) {
+__global__ void k_mg_prolong(int fnx, int fny, MgReal* fx, int cnx, int cny,
+                             const MgReal* __restrict__ cx) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     int l = blockIdx.z;
@@ -270,26 +281,18 @@ GpuPcg::GpuPcg(const Model3D& m, Precond pc) : m_(m), pc_(pc), n_(m.ncells()) {
             Level L;
             L.nx = g.nx;
             L.ny = g.ny;
-            auto upload = [](const std::vector<double>& v, Real** dst) {
-                std::vector<Real> h = to_real(v);
-                CUDA_CHECK(cudaMalloc(dst, h.size() * sizeof(Real)));
-                CUDA_CHECK(cudaMemcpy(*dst, h.data(), h.size() * sizeof(Real),
+            auto upload = [](const std::vector<double>& v, MgReal** dst) {
+                std::vector<MgReal> h = convert_to<MgReal>(v);
+                CUDA_CHECK(cudaMalloc(dst, h.size() * sizeof(MgReal)));
+                CUDA_CHECK(cudaMemcpy(*dst, h.data(), h.size() * sizeof(MgReal),
                                       cudaMemcpyHostToDevice));
             };
             upload(g.dx, &L.dx);
             upload(g.dy, &L.dy);
             upload(g.icx, &L.icx);
             upload(g.icy, &L.icy);
-            const size_t lb = (size_t)g.nx * g.ny * m.nz * sizeof(Real);
-            CUDA_CHECK(cudaMalloc(&L.fcp, lb));
-            CUDA_CHECK(cudaMalloc(&L.finv, lb));
-            if (levels_.empty()) {   // finest level works directly on PCG's r and z
-                L.b = r_;
-                L.x = z_;
-            } else {
-                CUDA_CHECK(cudaMalloc(&L.b, lb));
-                CUDA_CHECK(cudaMalloc(&L.x, lb));
-            }
+            const size_t lb = (size_t)g.nx * g.ny * m.nz * sizeof(MgReal);
+            for (MgReal** ptr : {&L.fcp, &L.finv, &L.b, &L.x}) CUDA_CHECK(cudaMalloc(ptr, lb));
             levels_.push_back(L);
         }
     }
@@ -304,13 +307,8 @@ GpuPcg::~GpuPcg() {
     for (Real* ptr : {P_, x_, b_, r_, z_, p_, Ap_, invd_}) cudaFree(ptr);
     cudaFree(dots_);
     for (size_t k = 0; k < levels_.size(); ++k) {
-        for (Real* ptr : {levels_[k].dx, levels_[k].dy, levels_[k].icx, levels_[k].icy,
-                          levels_[k].fcp, levels_[k].finv})
-            cudaFree(ptr);
-        if (k > 0) {  // level 0 borrows r_ and z_
-            cudaFree(levels_[k].b);
-            cudaFree(levels_[k].x);
-        }
+        const Level& L = levels_[k];
+        for (MgReal* ptr : {L.dx, L.dy, L.icx, L.icy, L.fcp, L.finv, L.b, L.x}) cudaFree(ptr);
     }
 }
 
@@ -325,16 +323,16 @@ void GpuPcg::set_shift(const std::vector<double>& shift) {
     }
     MgPlaneCoefs c = mg_plane_coefs(m_, shift);
     for (int l = 0; l < m_.nz; ++l) {
-        pp.kdz[l] = (Real)c.kdz[l];
-        pp.gzu_a[l] = (Real)c.gzu_a[l];
-        pp.gzd_a[l] = (Real)c.gzd_a[l];
-        pp.shift_a[l] = (Real)c.shift_a[l];
+        pp.kdz[l] = (MgReal)c.kdz[l];
+        pp.gzu_a[l] = (MgReal)c.gzu_a[l];
+        pp.gzd_a[l] = (MgReal)c.gzd_a[l];
+        pp.shift_a[l] = (MgReal)c.shift_a[l];
     }
     CUDA_CHECK(cudaMemcpyToSymbol(c_pp, &pp, sizeof(pp)));
     k_invdiag<<<stencil_grid(m_), stencil_block()>>>(invd_, m_.nx, m_.ny);
     KERNEL_CHECK();
     for (const Level& L : levels_) {  // multigrid column factors
-        const MgGrid<Real> g{L.nx, L.ny, L.dx, L.dy, L.icx, L.icy, nullptr, nullptr};
+        const MgGrid<MgReal> g{L.nx, L.ny, L.dx, L.dy, L.icx, L.icy, nullptr, nullptr};
         k_mg_factor<<<grid2d(L.nx, L.ny, 1), stencil_block()>>>(g, L.fcp, L.finv, m_.nz);
         KERNEL_CHECK();
     }
@@ -361,10 +359,10 @@ void GpuPcg::get_x(std::vector<Real>& T) const {
 void GpuPcg::vcycle(size_t k) {
     const Level& L = levels_[k];
     const int nz = m_.nz;
-    const MgGrid<Real> g{L.nx, L.ny, L.dx, L.dy, L.icx, L.icy, L.fcp, L.finv};
+    const MgGrid<MgReal> g{L.nx, L.ny, L.dx, L.dy, L.icx, L.icy, L.fcp, L.finv};
     const dim3 blk = stencil_block();
     const dim3 g2 = grid2d((L.nx + 1) / 2, L.ny, 1);  // sweeps: one thread per same-color column
-    CUDA_CHECK(cudaMemset(L.x, 0, (size_t)L.nx * L.ny * nz * sizeof(Real)));
+    CUDA_CHECK(cudaMemset(L.x, 0, (size_t)L.nx * L.ny * nz * sizeof(MgReal)));
 
     if (k + 1 == levels_.size()) {  // a single column: one line solve is exact
         k_mg_sweep<<<g2, blk>>>(g, L.b, L.x, nz, 0);
@@ -389,8 +387,6 @@ void GpuPcg::vcycle(size_t k) {
     KERNEL_CHECK();
 }
 
-void GpuPcg::precondition() { vcycle(0); }  // reads r_ (level 0 b), writes z_ (level 0 x)
-
 PcgStats GpuPcg::solve(double tol, int maxit) {
     if (pc_ == Precond::Multigrid) {
         const int nx = m_.nx, ny = m_.ny, nz = m_.nz;
@@ -399,7 +395,8 @@ PcgStats GpuPcg::solve(double tol, int maxit) {
         double h[3];
 
         CUDA_CHECK(cudaMemset(dots_, 0, 3 * sizeof(double)));
-        k_residual<<<sgrid, sblock>>>(b_, x_, r_, nx, ny, nz, dots_);
+        MgReal* b0 = levels_[0].b;
+        k_residual<<<sgrid, sblock>>>(b_, x_, r_, b0, nx, ny, nz, dots_);
         KERNEL_CHECK();
         CUDA_CHECK(cudaMemcpy(h, dots_, 3 * sizeof(double), cudaMemcpyDeviceToHost));
         const double bb = h[2];
@@ -408,11 +405,11 @@ PcgStats GpuPcg::solve(double tol, int maxit) {
         st.relres = std::sqrt(h[1] / bb);
         if (st.relres < tol) { st.converged = true; return st; }
 
-        precondition();
-        CUDA_CHECK(cudaMemcpy(p_, z_, n_ * sizeof(Real), cudaMemcpyDeviceToDevice));
+        vcycle(0);  // z = M^-1 r
         CUDA_CHECK(cudaMemset(dots_, 0, sizeof(double)));
-        k_dot<<<egrid, TB1>>>(r_, z_, n_, &dots_[0]);
+        k_from_mg_dot<<<egrid, TB1>>>(levels_[0].x, r_, z_, n_, &dots_[0]);
         KERNEL_CHECK();
+        CUDA_CHECK(cudaMemcpy(p_, z_, n_ * sizeof(Real), cudaMemcpyDeviceToDevice));
         double rz;
         CUDA_CHECK(cudaMemcpy(&rz, &dots_[0], sizeof(double), cudaMemcpyDeviceToHost));
 
@@ -424,7 +421,7 @@ PcgStats GpuPcg::solve(double tol, int maxit) {
             CUDA_CHECK(cudaMemcpy(&pAp, &dots_[2], sizeof(double), cudaMemcpyDeviceToHost));
             Real alpha = (Real)(rz / pAp);
 
-            k_update_xr<<<egrid, TB1>>>(alpha, p_, Ap_, x_, r_, n_, &dots_[1]);
+            k_update_xr<<<egrid, TB1>>>(alpha, p_, Ap_, x_, r_, b0, n_, &dots_[1]);
             KERNEL_CHECK();
             double rr;
             CUDA_CHECK(cudaMemcpy(&rr, &dots_[1], sizeof(double), cudaMemcpyDeviceToHost));
@@ -432,8 +429,8 @@ PcgStats GpuPcg::solve(double tol, int maxit) {
             st.relres = std::sqrt(rr / bb);
             if (st.relres < tol) { st.converged = true; break; }
 
-            precondition();
-            k_dot<<<egrid, TB1>>>(r_, z_, n_, &dots_[0]);
+            vcycle(0);
+            k_from_mg_dot<<<egrid, TB1>>>(levels_[0].x, r_, z_, n_, &dots_[0]);
             KERNEL_CHECK();
             double rz_new;
             CUDA_CHECK(cudaMemcpy(&rz_new, &dots_[0], sizeof(double), cudaMemcpyDeviceToHost));

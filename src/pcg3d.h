@@ -20,12 +20,26 @@ using Real = float;
 using Real = double;
 #endif
 
-// Copies a double vector into the working precision, with an explicit cast.
-inline std::vector<Real> to_real(const std::vector<double>& v) {
-    std::vector<Real> out(v.size());
-    for (size_t i = 0; i < v.size(); ++i) out[i] = (Real)v[i];
+// Precision of the multigrid V-cycle. Float by default, even though PCG runs in
+// double: the V-cycle only proposes a search direction, and PCG measures its
+// effect in double, so the preconditioner's rounding never accumulates in the
+// solution. Measured: identical iteration counts to 1e-10 at 200 to 800 cells
+// wide. Float halves the V-cycle's memory traffic, and GeForce GPUs do float
+// arithmetic ~64x faster than double. Build with -DMG_DOUBLE to compare.
+#ifdef MG_DOUBLE
+using MgReal = double;
+#else
+using MgReal = float;
+#endif
+
+// Copies a double vector into another precision, with an explicit cast.
+template <class T>
+std::vector<T> convert_to(const std::vector<double>& v) {
+    std::vector<T> out(v.size());
+    for (size_t i = 0; i < v.size(); ++i) out[i] = (T)v[i];
     return out;
 }
+inline std::vector<Real> to_real(const std::vector<double>& v) { return convert_to<Real>(v); }
 
 struct PcgStats {
     int iters = 0;
@@ -68,9 +82,9 @@ private:
 
     struct Level {
         int nx, ny;
-        std::vector<Real> dx, dy, icx, icy;  // geometry
-        std::vector<Real> fcp, finv;         // column factors (depend on the shift)
-        std::vector<Real> x, b;
+        std::vector<MgReal> dx, dy, icx, icy;  // geometry
+        std::vector<MgReal> fcp, finv;         // column factors (depend on the shift)
+        std::vector<MgReal> x, b;
     };
 
     const Model3D& m_;
@@ -78,7 +92,7 @@ private:
     std::vector<Real> gx_, gy_, gzd_, gzu_, shift_;
     std::vector<Real> P_, x_, b_, r_, z_, p_, Ap_, invd_;
     std::vector<Level> levels_;          // multigrid levels, finest first
-    std::vector<Real> kdz_, gzu_a_, gzd_a_, shift_a_;
+    std::vector<MgReal> kdz_, gzu_a_, gzd_a_, shift_a_;
 };
 
 class GpuPcg {
@@ -95,14 +109,13 @@ public:
     void get_x(std::vector<Real>& T) const;
 
 private:
-    void precondition();                 // z = M^-1 r (multigrid only)
-    void vcycle(size_t level);
+    void vcycle(size_t level);           // multigrid only; level 0 b must hold r
 
     struct Level {
         int nx, ny;
-        Real *dx = nullptr, *dy = nullptr, *icx = nullptr, *icy = nullptr;  // geometry
-        Real *fcp = nullptr, *finv = nullptr;  // column factors (depend on the shift)
-        Real *x = nullptr, *b = nullptr;       // level 0 points at the PCG's z and r
+        MgReal *dx = nullptr, *dy = nullptr, *icx = nullptr, *icy = nullptr;  // geometry
+        MgReal *fcp = nullptr, *finv = nullptr;  // column factors (depend on the shift)
+        MgReal *x = nullptr, *b = nullptr;
     };
 
     const Model3D& m_;

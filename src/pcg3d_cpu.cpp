@@ -17,10 +17,10 @@ CpuPcg::CpuPcg(const Model3D& m, Precond pc)
             Level L;
             L.nx = g.nx;
             L.ny = g.ny;
-            L.dx = to_real(g.dx);
-            L.dy = to_real(g.dy);
-            L.icx = to_real(g.icx);
-            L.icy = to_real(g.icy);
+            L.dx = convert_to<MgReal>(g.dx);
+            L.dy = convert_to<MgReal>(g.dy);
+            L.icx = convert_to<MgReal>(g.icx);
+            L.icy = convert_to<MgReal>(g.icy);
             for (auto* v : {&L.x, &L.b, &L.fcp, &L.finv}) v->assign((size_t)g.nx * g.ny * m.nz, 0);
             levels_.push_back(std::move(L));
         }
@@ -35,15 +35,15 @@ void CpuPcg::set_shift(const std::vector<double>& shift) {
                 invd_[m_.idx(i, j, l)] = Real(1) / diag_cell(i, j, m_.nx, m_.ny, gx_[l], gy_[l],
                                                              gzd_[l], gzu_[l], shift_[l]);
     MgPlaneCoefs c = mg_plane_coefs(m_, shift);
-    kdz_ = to_real(c.kdz);
-    gzu_a_ = to_real(c.gzu_a);
-    gzd_a_ = to_real(c.gzd_a);
-    shift_a_ = to_real(c.shift_a);
+    kdz_ = convert_to<MgReal>(c.kdz);
+    gzu_a_ = convert_to<MgReal>(c.gzu_a);
+    gzd_a_ = convert_to<MgReal>(c.gzd_a);
+    shift_a_ = convert_to<MgReal>(c.shift_a);
 
     // Multigrid column factors for every level.
-    const MgPlanes<Real> p{kdz_.data(), gzu_a_.data(), gzd_a_.data(), shift_a_.data(), m_.nz};
+    const MgPlanes<MgReal> p{kdz_.data(), gzu_a_.data(), gzd_a_.data(), shift_a_.data(), m_.nz};
     for (Level& L : levels_) {
-        const MgGrid<Real> g{L.nx, L.ny, L.dx.data(), L.dy.data(), L.icx.data(),
+        const MgGrid<MgReal> g{L.nx, L.ny, L.dx.data(), L.dy.data(), L.icx.data(),
                              L.icy.data(), nullptr, nullptr};
         for (int j = 0; j < L.ny; ++j)
             for (int i = 0; i < L.nx; ++i) mg_factor_column(g, p, L.fcp.data(), L.finv.data(), i, j);
@@ -66,10 +66,10 @@ void CpuPcg::set_rhs_transient() {
 // starting from x = 0. See mg3d.h for the design.
 void CpuPcg::vcycle(size_t k) {
     Level& L = levels_[k];
-    std::fill(L.x.begin(), L.x.end(), Real(0));
-    const MgGrid<Real> g{L.nx, L.ny, L.dx.data(), L.dy.data(), L.icx.data(),
+    std::fill(L.x.begin(), L.x.end(), MgReal(0));
+    const MgGrid<MgReal> g{L.nx, L.ny, L.dx.data(), L.dy.data(), L.icx.data(),
                          L.icy.data(), L.fcp.data(), L.finv.data()};
-    const MgPlanes<Real> p{kdz_.data(), gzu_a_.data(), gzd_a_.data(), shift_a_.data(), m_.nz};
+    const MgPlanes<MgReal> p{kdz_.data(), gzu_a_.data(), gzd_a_.data(), shift_a_.data(), m_.nz};
     auto sweep = [&](int color) {  // red-black: columns with (i + j) % 2 == color
         for (int j = 0; j < L.ny; ++j)
             for (int i = 0; i < L.nx; ++i)
@@ -89,7 +89,7 @@ void CpuPcg::vcycle(size_t k) {
     for (int l = 0; l < m_.nz; ++l)
         for (int J = 0; J < C.ny; ++J)
             for (int I = 0; I < C.nx; ++I) {
-                Real sum = 0;
+                MgReal sum = 0;
                 for (int j = 2 * J; j < std::min(2 * J + 2, L.ny); ++j)
                     for (int i = 2 * I; i < std::min(2 * I + 2, L.nx); ++i) {
                         size_t id = (size_t)l * fxy + (size_t)j * L.nx + i;
@@ -114,10 +114,11 @@ void CpuPcg::vcycle(size_t k) {
 void CpuPcg::precondition() {
     if (pc_ == Precond::Jacobi) {
         for (size_t c = 0; c < r_.size(); ++c) z_[c] = r_[c] * invd_[c];
-    } else {
-        levels_[0].b = r_;
+    } else {  // the V-cycle runs in MgReal precision
+        Level& L0 = levels_[0];
+        for (size_t c = 0; c < r_.size(); ++c) L0.b[c] = (MgReal)r_[c];
         vcycle(0);
-        z_ = levels_[0].x;
+        for (size_t c = 0; c < z_.size(); ++c) z_[c] = (Real)L0.x[c];
     }
 }
 
