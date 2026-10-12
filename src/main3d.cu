@@ -1,8 +1,11 @@
 // main3d.cu - verification and benchmark driver for the 3D stack solver.
 //
 //   thermal3d                  run all checks, then the steady benchmark (256 x 256)
-//   thermal3d <n>              steady benchmark on an n x n grid (CPU skipped above 256)
-//   thermal3d transient [n]    heat-up after power-on, n x n grid (default 200);
+//   thermal3d <n>              steady benchmark on an n x n grid, Jacobi vs multigrid
+//                              (CPU skipped above 256)
+//   thermal3d transient [n] [jacobi]
+//                              heat-up after power-on, n x n grid (default 200),
+//                              multigrid unless "jacobi" is given;
 //                              prints a timeline and writes transient.csv
 // Compiled with -DREAL_FLOAT the solver runs in float, to show why it shouldn't.
 #include <algorithm>
@@ -69,13 +72,13 @@ static bool verify() {
 
     // Test 1: uniform power has an exact answer (each column is a 1D resistor chain).
     {
-        printf("== verify 1: uniform power, %d x %d x %d, vs exact 1D solution ==\n", n, n,
+        printf("== verify 1: uniform power, %d x %d x %d, vs exact 1D solution (Jacobi) ==\n", n, n,
                default_model(n, n).nz);
         Model3D m = default_model(n, n);
         add_uniform_power(m, 0, 25.0);
         add_uniform_power(m, 2, 25.0);
-        SolveResult c = cpu_pcg(m, kTol, kMaxIt);
-        SolveResult g = gpu_pcg(m, kTol, kMaxIt);
+        SolveResult c = cpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
+        SolveResult g = gpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
         std::vector<double> Tz = analytic_1d(m);
         double tmax = *std::max_element(Tz.begin(), Tz.end());
         double ec = 0, eg = 0;
@@ -97,10 +100,10 @@ static bool verify() {
 
     // Test 2: hotspot. No closed form, so check energy balance and GPU vs CPU.
     {
-        printf("\n== verify 2: hotspot in bottom tier, %d x %d ==\n", n, n);
+        printf("\n== verify 2: hotspot in bottom tier, %d x %d (Jacobi) ==\n", n, n);
         Model3D m = hotspot_model(n);
-        SolveResult c = cpu_pcg(m, kTol, kMaxIt);
-        SolveResult g = gpu_pcg(m, kTol, kMaxIt);
+        SolveResult c = cpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
+        SolveResult g = gpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
         double P = total_power(m);
         printf("  iterations: CPU %d, GPU %d\n", c.iters, g.iters);
         ok &= c.converged && g.converged;
@@ -115,13 +118,14 @@ static bool verify() {
     // heat stored), the GPU must match the CPU, and after a long time the
     // temperatures must settle to the steady-state solution.
     {
-        printf("\n== verify 3: transient heat-up, hotspot stack, %d x %d ==\n", n, n);
+        printf("\n== verify 3: transient heat-up, hotspot stack, %d x %d (Jacobi) ==\n", n, n);
         Model3D m = hotspot_model(n);
         const double P = total_power(m);
 
         TransientOptions shortrun;
         shortrun.t_end = 0.02;
         shortrun.growth = 1.2;
+        shortrun.precond = Precond::Jacobi;
         TransientResult c = run_transient<CpuPcg>(m, shortrun);
         TransientResult g = run_transient<GpuPcg>(m, shortrun);
         printf("  first 20 ms: %zu steps, PCG iterations CPU %ld, GPU %ld\n", g.steps.size(),
@@ -133,15 +137,51 @@ static bool verify() {
         TransientOptions longrun;
         longrun.t_end = 3.0;  // ~15 thermal time constants of the heat sink
         longrun.dt_max = 0.1;
+        longrun.precond = Precond::Jacobi;
         TransientResult lg = run_transient<GpuPcg>(m, longrun);
         double eb = 0;
         for (const StepRecord& r : lg.steps)
             eb = std::max(eb, std::fabs(r.q_out + r.q_stored - P) / P);
         ok &= lg.converged;
         ok &= check("GPU energy balance, worst step", eb, 1e-6);
-        SolveResult ss = gpu_pcg(m, 1e-10, kMaxIt);
+        SolveResult ss = gpu_pcg(m, 1e-10, kMaxIt, Precond::Jacobi);
         ok &= check("GPU at 3 s vs steady state / Tmax", max_abs_diff(lg.T, ss.T) / max_of(ss.T),
                     1e-5);
+    }
+
+    // Test 4: multigrid preconditioner. Same answers as Jacobi, far fewer iterations.
+    {
+        printf("\n== verify 4: multigrid preconditioner, hotspot stack, %d x %d ==\n", n, n);
+        Model3D m = hotspot_model(n);
+        const double P = total_power(m);
+        SolveResult c = cpu_pcg(m, 1e-9, kMaxIt, Precond::Multigrid);
+        SolveResult g = gpu_pcg(m, 1e-9, kMaxIt, Precond::Multigrid);
+        SolveResult gj = gpu_pcg(m, 1e-9, kMaxIt, Precond::Jacobi);
+        printf("  steady iterations to 1e-9: multigrid CPU %d, GPU %d; Jacobi GPU %d\n", c.iters,
+               g.iters, gj.iters);
+        ok &= c.converged && g.converged && gj.converged;
+        ok &= check("CPU true residual", true_relres(m, c.T), kTrueTol);
+        ok &= check("GPU true residual", true_relres(m, g.T), kTrueTol);
+        ok &= check("max |GPU - CPU| / Tmax", max_abs_diff(g.T, c.T) / max_of(c.T), kMatchTol);
+        ok &= check("max |multigrid - Jacobi| / Tmax", max_abs_diff(g.T, gj.T) / max_of(gj.T),
+                    kMatchTol);
+
+        TransientOptions o;
+        o.t_end = 0.02;
+        o.growth = 1.2;
+        o.precond = Precond::Multigrid;
+        TransientResult tm = run_transient<GpuPcg>(m, o);
+        o.precond = Precond::Jacobi;
+        TransientResult tj = run_transient<GpuPcg>(m, o);
+        printf("  transient, first 20 ms: PCG iterations multigrid %ld, Jacobi %ld\n",
+               tm.total_iters, tj.total_iters);
+        double eb = 0;
+        for (const StepRecord& r : tm.steps)
+            eb = std::max(eb, std::fabs(r.q_out + r.q_stored - P) / P);
+        ok &= tm.converged && tj.converged;
+        ok &= check("transient energy balance, worst step", eb, 1e-6);
+        ok &= check("transient multigrid vs Jacobi / Tmax", max_abs_diff(tm.T, tj.T) / max_of(tj.T),
+                    kMatchTol);
     }
     return ok;
 }
@@ -159,20 +199,21 @@ static double time_to(const std::vector<StepRecord>& steps, double target) {
     return -1;
 }
 
-static void transient_demo(int n) {
+static void transient_demo(int n, Precond pc) {
     Model3D m = hotspot_model(n);
     const double P = total_power(m);
-    printf("\n== transient: power switched on at t = 0, %d x %d x %d = %zu cells, %.0f W, %s ==\n",
-           n, n, m.nz, m.ncells(), P, sizeof(Real) == 8 ? "double" : "float");
+    printf("\n== transient: power switched on at t = 0, %d x %d x %d = %zu cells, %.0f W, %s, %s ==\n",
+           n, n, m.nz, m.ncells(), P, sizeof(Real) == 8 ? "double" : "float", precond_name(pc));
 
-    gpu_pcg(default_model(32, 32), kTol, 10);  // warm-up: pays CUDA context setup
+    gpu_pcg(default_model(32, 32), kTol, 10, Precond::Jacobi);  // warm-up: CUDA context setup
 
-    SolveResult ss = gpu_pcg(m, 1e-8, kMaxIt);
+    SolveResult ss = gpu_pcg(m, 1e-8, kMaxIt, Precond::Multigrid);
     const double Tss = max_of(ss.T);
 
     TransientOptions o;
     o.t_end = 2.0;
     o.dt_max = 0.1;
+    o.precond = pc;
     TransientResult tr = run_transient<GpuPcg>(m, o);
 
     printf("  %10s %10s %10s %8s %12s %12s\n", "t (ms)", "T_max (C)", "% of rise", "iters",
@@ -215,37 +256,51 @@ static void transient_demo(int n) {
 
 static void benchmark(int n) {
     Model3D m = hotspot_model(n);
-    printf("\n== hotspot stack: %d x %d x %d = %zu cells, %.0f W, ambient %.0f C, %s ==\n",
+    printf("\n== steady state: %d x %d x %d = %zu cells, %.0f W, ambient %.0f C, %s ==\n",
            n, n, m.nz, m.ncells(), total_power(m), m.T_amb,
            sizeof(Real) == 8 ? "double" : "float");
 
-    gpu_pcg(default_model(32, 32), kTol, 10);  // warm-up: pays CUDA context setup
+    gpu_pcg(default_model(32, 32), kTol, 10, Precond::Jacobi);  // warm-up: CUDA context setup
 
-    SolveResult g = gpu_pcg(m, kTol, kMaxIt);
-    print_layers(m, g.T);
+    SolveResult gm = gpu_pcg(m, kTol, kMaxIt, Precond::Multigrid);
+    SolveResult gj = gpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
+    print_layers(m, gm.T);
 
-    printf("\n  %-6s %8s %12s %12s\n", "", "iters", "time (ms)", "ms / iter");
-    if (n <= 256) {
-        SolveResult c = cpu_pcg(m, kTol, kMaxIt);
-        printf("  %-6s %8d %12.1f %12.3f\n", "CPU", c.iters, c.ms, c.ms / c.iters);
-        printf("  %-6s %8d %12.1f %12.3f   (%.1fx)\n", "GPU", g.iters, g.ms, g.ms / g.iters,
-               c.ms / g.ms);
-        printf("  max |GPU - CPU| / Tmax = %.3e\n", max_abs_diff(g.T, c.T) / max_of(c.T));
+    printf("\n  %-16s %8s %12s %12s\n", "", "iters", "time (ms)", "ms / iter");
+    auto row = [](const char* name, const SolveResult& r, double ref_ms) {
+        printf("  %-16s %8d %12.1f %12.3f", name, r.iters, r.ms, r.ms / r.iters);
+        if (ref_ms > 0) printf("   %7.1fx", ref_ms / r.ms);
+        printf("\n");
+    };
+    double ref = 0;
+    if (n <= 256) {  // the CPU is too slow beyond this
+        SolveResult cj = cpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
+        SolveResult cm = cpu_pcg(m, kTol, kMaxIt, Precond::Multigrid);
+        ref = cj.ms;
+        printf("  (speedup is relative to CPU Jacobi)\n");
+        row("CPU Jacobi", cj, ref);
+        row("CPU multigrid", cm, ref);
     } else {
-        printf("  %-6s %8d %12.1f %12.3f\n", "GPU", g.iters, g.ms, g.ms / g.iters);
+        ref = gj.ms;
+        printf("  (speedup is relative to GPU Jacobi)\n");
     }
+    row("GPU Jacobi", gj, ref);
+    row("GPU multigrid", gm, ref);
+    printf("  max |multigrid - Jacobi| / Tmax = %.3e\n", max_abs_diff(gm.T, gj.T) / max_of(gj.T));
 
     // Always check the answer, not just the solver's own convergence flag.
-    double P = total_power(m), tr = true_relres(m, g.T);
-    printf("  GPU true residual = %.2e   energy balance |out - in| / in = %.2e\n", tr,
-           std::fabs(heat_out(m, g.T) - P) / P);
-    if (!g.converged) printf("  WARNING: GPU solve hit the iteration limit (relres %.2e)\n", g.relres);
+    double P = total_power(m), tr = true_relres(m, gm.T);
+    printf("  GPU multigrid: true residual = %.2e   energy balance |out - in| / in = %.2e\n", tr,
+           std::fabs(heat_out(m, gm.T) - P) / P);
+    if (!gm.converged || !gj.converged) printf("  WARNING: a solve hit the iteration limit\n");
     if (tr > kTrueTol) printf("  WARNING: true residual above %.0e - result is not accurate\n", kTrueTol);
 }
 
 int main(int argc, char** argv) {
     if (argc >= 2 && strcmp(argv[1], "transient") == 0) {
-        transient_demo(argc >= 3 ? atoi(argv[2]) : 200);
+        int n = argc >= 3 ? atoi(argv[2]) : 200;
+        bool jacobi = argc >= 4 && strcmp(argv[3], "jacobi") == 0;
+        transient_demo(n, jacobi ? Precond::Jacobi : Precond::Multigrid);
         return 0;
     }
     if (argc == 2) {

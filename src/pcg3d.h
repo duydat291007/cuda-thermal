@@ -33,6 +33,15 @@ struct PcgStats {
     bool converged = false;
 };
 
+// Preconditioner: Jacobi divides by the diagonal (cheap, but the iteration count
+// grows with the grid size). Multigrid runs one V-cycle (mg3d.h); it costs a few
+// stencil sweeps but needs ~10 iterations at any grid size.
+enum class Precond { Jacobi, Multigrid };
+
+inline const char* precond_name(Precond p) {
+    return p == Precond::Jacobi ? "Jacobi" : "multigrid";
+}
+
 // Both solver classes have the same interface, so the transient driver
 // (transient3d.h) works with either one.
 //
@@ -45,7 +54,7 @@ struct PcgStats {
 
 class CpuPcg {
 public:
-    explicit CpuPcg(const Model3D& m);
+    CpuPcg(const Model3D& m, Precond pc);
     void set_shift(const std::vector<double>& shift);
     void set_x_zero();
     void set_rhs_steady();
@@ -54,14 +63,25 @@ public:
     void get_x(std::vector<Real>& T) const { T = x_; }
 
 private:
+    void precondition();                 // z = M^-1 r
+    void vcycle(size_t level);           // multigrid: solves level's b into its x
+
+    struct Level {
+        int nx, ny;
+        std::vector<Real> dx, dy, x, b;
+    };
+
     const Model3D& m_;
+    Precond pc_;
     std::vector<Real> gx_, gy_, gzd_, gzu_, shift_;
     std::vector<Real> P_, x_, b_, r_, z_, p_, Ap_, invd_;
+    std::vector<Level> levels_;          // multigrid levels, finest first
+    std::vector<Real> kdz_, gzu_a_, gzd_a_, shift_a_;
 };
 
 class GpuPcg {
 public:
-    explicit GpuPcg(const Model3D& m);
+    GpuPcg(const Model3D& m, Precond pc);
     ~GpuPcg();
     GpuPcg(const GpuPcg&) = delete;
     GpuPcg& operator=(const GpuPcg&) = delete;
@@ -73,11 +93,22 @@ public:
     void get_x(std::vector<Real>& T) const;
 
 private:
+    void precondition();                 // z = M^-1 r (multigrid only)
+    void vcycle(size_t level);
+
+    struct Level {
+        int nx, ny;
+        Real *dx = nullptr, *dy = nullptr;  // cell widths (device)
+        Real *x = nullptr, *b = nullptr;    // level 0 points at the PCG's z and r
+    };
+
     const Model3D& m_;
+    Precond pc_;
     size_t n_;
     Real *P_ = nullptr, *x_ = nullptr, *b_ = nullptr, *r_ = nullptr, *z_ = nullptr,
          *p_ = nullptr, *Ap_ = nullptr, *invd_ = nullptr;
     double* dots_ = nullptr;
+    std::vector<Level> levels_;
 };
 
 // Steady-state solve from T = 0, with timing (GPU time includes allocation and
@@ -89,8 +120,8 @@ struct SolveResult {
     double ms = 0;
     bool converged = false;
 };
-SolveResult cpu_pcg(const Model3D& m, double tol, int maxit);
-SolveResult gpu_pcg(const Model3D& m, double tol, int maxit);
+SolveResult cpu_pcg(const Model3D& m, double tol, int maxit, Precond pc);
+SolveResult gpu_pcg(const Model3D& m, double tol, int maxit, Precond pc);
 
 // ||P - A T|| / ||P|| for the steady problem, recomputed from scratch in double.
 // Unlike the tracked residual, this can't drift, so it shows whether a solve

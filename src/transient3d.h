@@ -23,6 +23,7 @@ struct TransientOptions {
     double t_end = 1.0;    // simulated time (s)
     double tol = 1e-9;     // PCG tolerance per step, ||r|| / ||b||
     int maxit = 50000;
+    Precond precond = Precond::Multigrid;
 };
 
 struct StepRecord {
@@ -47,7 +48,7 @@ template <class Solver>
 TransientResult run_transient(const Model3D& m, const TransientOptions& o) {
     auto t0 = std::chrono::high_resolution_clock::now();
     TransientResult res;
-    Solver s(m);
+    Solver s(m, o.precond);
     s.set_x_zero();
 
     std::vector<Real> T_old(m.ncells(), Real(0)), T_new;
