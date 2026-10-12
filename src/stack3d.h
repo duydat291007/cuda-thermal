@@ -28,6 +28,7 @@ struct Layer {
     std::string name;
     double thickness;  // m
     double k;          // W/(m K)
+    double rho_c;      // volumetric heat capacity, J/(m^3 K) (density x specific heat)
     int ncells;        // number of z-planes in this layer
     bool active;       // dissipates power
 };
@@ -44,6 +45,7 @@ struct Model3D {
     std::vector<double> dz, k;
     std::vector<double> gx, gy;    // lateral conductance between neighbor cells (W/K)
     std::vector<double> gzd, gzu;  // conductance to plane below / above (or ambient)
+    std::vector<double> cap;       // heat capacity of one cell (J/K)
 
     std::vector<double> P;         // power per cell (W), nx * ny * nz
 
@@ -75,8 +77,9 @@ inline Model3D build_model(const std::vector<Layer>& layers, int nx, int ny,
 
     const double A = m.dx * m.dy;
     m.gx.resize(m.nz); m.gy.resize(m.nz);
-    m.gzd.resize(m.nz); m.gzu.resize(m.nz);
+    m.gzd.resize(m.nz); m.gzu.resize(m.nz); m.cap.resize(m.nz);
     for (int l = 0; l < m.nz; ++l) {
+        m.cap[l] = layers[m.plane_layer[l]].rho_c * A * m.dz[l];
         m.gx[l] = m.k[l] * m.dy * m.dz[l] / m.dx;
         m.gy[l] = m.k[l] * m.dx * m.dz[l] / m.dy;
         double half = m.dz[l] / (2.0 * m.k[l]);
@@ -97,11 +100,12 @@ inline Model3D build_model(const std::vector<Layer>& layers, int nx, int ny,
 // the bottom tier's heat has to cross it to reach the heat sink.
 inline std::vector<Layer> default_stack() {
     return {
-        {"Si tier 2 (bottom)", 50e-6, 130.0, 2, true},
-        {"bond + BEOL",        10e-6,   2.0, 1, false},
-        {"Si tier 1 (top)",    50e-6, 130.0, 2, true},
-        {"TIM",                25e-6,   5.0, 1, false},
-        {"Cu spreader",         1e-3, 400.0, 4, false},
+    //  name                 thick    k      rho*c   planes active
+        {"Si tier 2 (bottom)", 50e-6, 130.0, 1.66e6, 2, true},
+        {"bond + BEOL",        10e-6,   2.0, 1.70e6, 1, false},
+        {"Si tier 1 (top)",    50e-6, 130.0, 1.66e6, 2, true},
+        {"TIM",                25e-6,   5.0, 2.00e6, 1, false},
+        {"Cu spreader",         1e-3, 400.0, 3.45e6, 4, false},
     };
 }
 
@@ -150,6 +154,22 @@ double heat_out(const Model3D& m, const Vec& T) {
     for (size_t c = 0; c < m.nxy(); ++c) {
         q += m.gzu[m.nz - 1] * (double)T[(size_t)(m.nz - 1) * m.nxy() + c];
         q += m.gzd[0] * (double)T[c];
+    }
+    return q;
+}
+
+// Rate at which heat is being stored, sum of C (T_new - T_old) / dt, in W.
+// In a transient step: stored + heat_out = power in (energy balance).
+template <class Vec>
+double heat_stored(const Model3D& m, const Vec& T_old, const Vec& T_new, double dt) {
+    double q = 0;
+    for (int l = 0; l < m.nz; ++l) {
+        double s = 0;
+        for (size_t c = 0; c < m.nxy(); ++c) {
+            size_t id = (size_t)l * m.nxy() + c;
+            s += (double)T_new[id] - (double)T_old[id];
+        }
+        q += m.cap[l] * s / dt;
     }
     return q;
 }

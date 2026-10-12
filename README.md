@@ -2,9 +2,9 @@
 
 GPU thermal solver for 3D-stacked ICs, written in CUDA C++.
 
-**Current milestone:** steady-state temperature of a layered 3D chip stack,
-solved with a matrix-free preconditioned conjugate gradient (PCG) method on the
-CPU (reference) and the GPU.
+**Current milestone:** temperature of a layered 3D chip stack, steady state and
+transient (heat-up after power-on), solved with a matrix-free preconditioned
+conjugate gradient (PCG) method on the CPU (reference) and the GPU.
 
 ## Programs
 | Program | What it solves |
@@ -15,13 +15,13 @@ CPU (reference) and the GPU.
 ## The 3D model
 A two-tier stack on a 10 mm x 10 mm footprint, bottom to top:
 
-| Layer | Thickness | k (W/m K) | Power |
-|---|---|---|---|
-| Si tier 2 (bottom) | 50 um | 130 | 25 W (incl. 3 W in a 1 mm hotspot) |
-| bond + BEOL | 10 um | 2 | |
-| Si tier 1 (top) | 50 um | 130 | 25 W |
-| TIM | 25 um | 5 | |
-| Cu spreader | 1 mm | 400 | |
+| Layer | Thickness | k (W/m K) | rho*c (J/m³K) | Power |
+|---|---|---|---|---|
+| Si tier 2 (bottom) | 50 um | 130 | 1.66e6 | 25 W (incl. 3 W in a 1 mm hotspot) |
+| bond + BEOL | 10 um | 2 | 1.70e6 | |
+| Si tier 1 (top) | 50 um | 130 | 1.66e6 | 25 W |
+| TIM | 25 um | 5 | 2.00e6 | |
+| Cu spreader | 1 mm | 400 | 3.45e6 | |
 
 The top connects to a heat sink (h = 2e4 W/m²K, i.e. 0.5 K/W); the sides and
 bottom are adiabatic. Cells exchange heat through conductances; across material
@@ -32,6 +32,14 @@ different cell thicknesses.
 solver is compared against it. Every solve also recomputes the true residual
 `||P - A T|| / ||P||` from scratch, and must conserve energy (heat out through
 the sink equals power in). The GPU must match the CPU.
+
+**Transient:** backward Euler time stepping, `(C/dt + A) T_new = C/dt T_old + P`,
+one PCG solve per step warm-started from the previous temperature. Time steps
+start at 10 us and grow 10% per step, because the stack has very different time
+scales: the hotspot reaches half its final rise in ~4 ms (silicon heating up
+locally), then climbs slowly for ~0.5 s while the copper spreader and heat sink
+warm up. Each step must conserve energy (power in = heat out + heat stored), and
+a long run must settle to the steady-state solution.
 
 **Precision:** the solver runs in double. Neighboring cells in the thin silicon
 layers differ by ~1e-5 K while T is ~50 K, only a few float ulps apart. In float,
@@ -48,7 +56,9 @@ is a whole number of cells (200, 400, 800).
 build.bat            # debug build, SYNC_CHECK=1
 thermal3d.exe        # checks, stack temperatures, benchmark 256 x 256
 build.bat bench      # benchmark build, SYNC_CHECK=0
-thermal3d.exe 400    # benchmark a 400 x 400 grid (GPU only above 256)
+thermal3d.exe 400    # steady benchmark on a 400 x 400 grid (GPU only above 256)
+thermal3d.exe transient       # heat-up timeline on 200 x 200, writes transient.csv
+thermal3d.exe transient 400   # same on a finer grid
 thermal3d_float.exe 800   # the float version, to see the precision failure
 ```
 CMake alternative:
@@ -60,10 +70,12 @@ cmake --build build --config Release
 ## Files
 | File | Purpose |
 |---|---|
-| `src/stack3d.h` | Layers, conductances, power maps, exact 1D solution, energy balance |
+| `src/stack3d.h` | Layers, conductances, heat capacities, power maps, exact 1D solution, energy balance |
 | `src/operator3d.h` | 7-point operator shared by CPU and GPU |
+| `src/pcg3d.h` | Solver interface: `CpuPcg` and `GpuPcg` objects, steady-state wrappers |
 | `src/pcg3d_cpu.cpp` | CPU reference PCG |
 | `src/pcg3d_gpu.cu` | GPU PCG: stencil, update and reduction kernels |
+| `src/transient3d.h` | Backward Euler time stepping, works with either solver |
 | `src/main3d.cu` | 3D verification and benchmark driver |
 | `src/cuda_check.h` | `CUDA_CHECK` and `KERNEL_CHECK` macros |
 | `src/problem.h`, `src/*jacobi*`, `src/main.cu` | 2D Jacobi model problem |
@@ -71,9 +83,9 @@ cmake --build build --config Release
 ## Roadmap
 1. ~~2D CPU Jacobi reference~~
 2. ~~CUDA Jacobi kernels: naive and shared-memory tiled~~
-3. ~~3D layered stack, steady state, PCG solver in double~~ (here). Jacobi needed
+3. ~~3D layered stack, steady state, PCG solver in double~~. Jacobi needed
    ~90x more iterations than PCG on this stack, so the implicit solver moved up.
-4. Transient: backward Euler time stepping with PCG
-5. Faster PCG: keep scalars on the GPU, fuse kernels, better preconditioner
+4. ~~Transient: backward Euler time stepping with PCG~~ (here)
+5. Faster PCG: multigrid preconditioner, keep scalars on the GPU, fuse kernels
 6. Power maps from file, TSVs, anisotropic layers
 7. Validate and benchmark against 3D-ICE
