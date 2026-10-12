@@ -42,11 +42,10 @@ struct Model3D {
     // Per z-plane data.
     std::vector<int> plane_layer;  // which layer each plane belongs to
     std::vector<double> dz, k;
-    std::vector<double> gzu_d;     // conductance to the plane above (or ambient), double
-    std::vector<float> gx, gy;     // lateral conductance between neighbor cells
-    std::vector<float> gzd, gzu;   // conductance to plane below / above (or ambient)
+    std::vector<double> gx, gy;    // lateral conductance between neighbor cells (W/K)
+    std::vector<double> gzd, gzu;  // conductance to plane below / above (or ambient)
 
-    std::vector<float> P;          // power per cell (W), nx * ny * nz
+    std::vector<double> P;         // power per cell (W), nx * ny * nz
 
     size_t nxy() const { return (size_t)nx * ny; }
     size_t ncells() const { return nxy() * nz; }
@@ -76,22 +75,20 @@ inline Model3D build_model(const std::vector<Layer>& layers, int nx, int ny,
 
     const double A = m.dx * m.dy;
     m.gx.resize(m.nz); m.gy.resize(m.nz);
-    m.gzd.resize(m.nz); m.gzu.resize(m.nz); m.gzu_d.resize(m.nz);
+    m.gzd.resize(m.nz); m.gzu.resize(m.nz);
     for (int l = 0; l < m.nz; ++l) {
-        m.gx[l] = (float)(m.k[l] * m.dy * m.dz[l] / m.dx);
-        m.gy[l] = (float)(m.k[l] * m.dx * m.dz[l] / m.dy);
+        m.gx[l] = m.k[l] * m.dy * m.dz[l] / m.dx;
+        m.gy[l] = m.k[l] * m.dx * m.dz[l] / m.dy;
         double half = m.dz[l] / (2.0 * m.k[l]);
         double R_up = (l < m.nz - 1) ? half + m.dz[l + 1] / (2.0 * m.k[l + 1])
                                      : half + 1.0 / h_top;
-        m.gzu_d[l] = A / R_up;
-        m.gzu[l] = (float)m.gzu_d[l];
+        m.gzu[l] = A / R_up;
     }
     for (int l = 0; l < m.nz; ++l) {
         if (l > 0) m.gzd[l] = m.gzu[l - 1];
-        else m.gzd[l] = (h_bot > 0) ? (float)(A / (m.dz[0] / (2.0 * m.k[0]) + 1.0 / h_bot))
-                                    : 0.0f;
+        else m.gzd[l] = (h_bot > 0) ? A / (m.dz[0] / (2.0 * m.k[0]) + 1.0 / h_bot) : 0.0;
     }
-    m.P.assign(m.ncells(), 0.0f);
+    m.P.assign(m.ncells(), 0.0);
     return m;
 }
 
@@ -116,7 +113,7 @@ inline Model3D default_model(int nx, int ny) {
 // Spreads `watts` evenly over every cell of active layer `layer`.
 inline void add_uniform_power(Model3D& m, int layer, double watts) {
     int planes = m.layers[layer].ncells;
-    float w = (float)(watts / ((double)m.nxy() * planes));
+    double w = watts / ((double)m.nxy() * planes);
     for (int l = 0; l < m.nz; ++l)
         if (m.plane_layer[l] == layer)
             for (size_t c = 0; c < m.nxy(); ++c) m.P[(size_t)l * m.nxy() + c] += w;
@@ -136,22 +133,23 @@ inline void add_hotspot(Model3D& m, int layer, double xc, double yc, double size
             }
     }
     if (cells.empty()) { fprintf(stderr, "Hotspot covers no cells\n"); exit(1); }
-    for (size_t c : cells) m.P[c] += (float)(watts / cells.size());
+    for (size_t c : cells) m.P[c] += watts / (double)cells.size();
 }
 
 inline double total_power(const Model3D& m) {
     double s = 0;
-    for (float p : m.P) s += p;
+    for (double p : m.P) s += p;
     return s;
 }
 
 // Heat leaving through the top (heat sink) and bottom boundaries, in W.
 // At steady state this must equal the total power: an energy-balance check.
-inline double heat_out(const Model3D& m, const std::vector<float>& T) {
+template <class Vec>
+double heat_out(const Model3D& m, const Vec& T) {
     double q = 0;
     for (size_t c = 0; c < m.nxy(); ++c) {
-        q += (double)m.gzu[m.nz - 1] * T[(size_t)(m.nz - 1) * m.nxy() + c];
-        q += (double)m.gzd[0] * T[c];
+        q += m.gzu[m.nz - 1] * (double)T[(size_t)(m.nz - 1) * m.nxy() + c];
+        q += m.gzd[0] * (double)T[c];
     }
     return q;
 }
@@ -167,7 +165,7 @@ inline std::vector<double> analytic_1d(const Model3D& m) {
         flux[l] = F;  // heat crossing the top face of plane l
     }
     const double nxy = (double)m.nxy();
-    T[m.nz - 1] = flux[m.nz - 1] / (m.gzu_d[m.nz - 1] * nxy);
-    for (int l = m.nz - 2; l >= 0; --l) T[l] = T[l + 1] + flux[l] / (m.gzu_d[l] * nxy);
+    T[m.nz - 1] = flux[m.nz - 1] / (m.gzu[m.nz - 1] * nxy);
+    for (int l = m.nz - 2; l >= 0; --l) T[l] = T[l + 1] + flux[l] / (m.gzu[l] * nxy);
     return T;
 }

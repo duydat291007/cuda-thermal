@@ -11,9 +11,9 @@
 
 // Diagonal of A for cell (i, j, l): total conductance out of the cell.
 // Neighbors outside the side walls don't exist (adiabatic), so they add nothing.
-HD inline float diag_cell(int i, int j, int nx, int ny, float gx, float gy,
-                          float gzd, float gzu) {
-    float d = 0.0f;
+template <class R>
+HD inline R diag_cell(int i, int j, int nx, int ny, R gx, R gy, R gzd, R gzu) {
+    R d = 0;
     if (i > 0) d += gx;
     if (i < nx - 1) d += gx;
     if (j > 0) d += gy;
@@ -23,11 +23,12 @@ HD inline float diag_cell(int i, int j, int nx, int ny, float gx, float gy,
 
 // (A x) for cell (i, j, l) = diag * x_c - sum over neighbors of G_n * x_n.
 // gx, gy, gzd, gzu are the conductances of plane l.
-HD inline float apply_cell(const float* x, int i, int j, int l, int nx, int ny,
-                           int nz, float gx, float gy, float gzd, float gzu) {
+template <class R>
+HD inline R apply_cell(const R* x, int i, int j, int l, int nx, int ny, int nz,
+                       R gx, R gy, R gzd, R gzu) {
     const size_t sxy = (size_t)nx * ny;
     const size_t id = (size_t)l * sxy + (size_t)j * nx + i;
-    float s = 0.0f;
+    R s = 0;
     if (i > 0) s += gx * x[id - 1];
     if (i < nx - 1) s += gx * x[id + 1];
     if (j > 0) s += gy * x[id - nx];

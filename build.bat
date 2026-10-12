@@ -10,4 +10,7 @@ nvcc %FLAGS% src\main.cu src\gpu_jacobi.cu src\cpu_jacobi.cpp -o thermal2d.exe
 if errorlevel 1 exit /b 1
 nvcc %FLAGS% src\main3d.cu src\pcg3d_gpu.cu src\pcg3d_cpu.cpp -o thermal3d.exe
 if errorlevel 1 exit /b 1
-echo Built thermal2d.exe and thermal3d.exe with SYNC_CHECK=%SYNC%
+rem Same solver in float, kept to demonstrate why the solver uses double.
+nvcc %FLAGS% -DREAL_FLOAT src\main3d.cu src\pcg3d_gpu.cu src\pcg3d_cpu.cpp -o thermal3d_float.exe
+if errorlevel 1 exit /b 1
+echo Built thermal2d.exe, thermal3d.exe and thermal3d_float.exe with SYNC_CHECK=%SYNC%

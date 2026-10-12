@@ -19,3 +19,10 @@ add_executable(thermal3d
     src/pcg3d_gpu.cu
     src/pcg3d_cpu.cpp)
 target_compile_definitions(thermal3d PRIVATE SYNC_CHECK=${SYNC_CHECK})
+
+# Same solver in float, kept to demonstrate why the solver uses double.
+add_executable(thermal3d_float
+    src/main3d.cu
+    src/pcg3d_gpu.cu
+    src/pcg3d_cpu.cpp)
+target_compile_definitions(thermal3d_float PRIVATE SYNC_CHECK=${SYNC_CHECK} REAL_FLOAT)

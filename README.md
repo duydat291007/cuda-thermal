@@ -29,15 +29,27 @@ interfaces the two half-cells are in series (harmonic mean of k). Layers can use
 different cell thicknesses.
 
 **Checks:** with uniform power the exact answer is a 1D resistor chain, so the
-solver is compared against it. With a hotspot it must conserve energy (heat out
-through the sink equals power in) and the GPU must match the CPU.
+solver is compared against it. Every solve also recomputes the true residual
+`||P - A T|| / ||P||` from scratch, and must conserve energy (heat out through
+the sink equals power in). The GPU must match the CPU.
+
+**Precision:** the solver runs in double. Neighboring cells in the thin silicon
+layers differ by ~1e-5 K while T is ~50 K, only a few float ulps apart. In float,
+PCG's tracked residual reaches 1e-6 while the true residual stays at 1e-3 (64 x 64)
+to 0.4 (800 x 800), and the 800 x 800 temperatures came out 0.6 C too low.
+`thermal3d_float.exe` is the same solver in float, kept to show this.
+
+**Grid convergence** (double, bottom-tier peak): 79.80 C at 200 x 200,
+79.81 C at 400 x 400, 79.82 C at 800 x 800. Use sizes where the 1 mm hotspot
+is a whole number of cells (200, 400, 800).
 
 ## Build and run (x64 Native Tools Command Prompt)
 ```
 build.bat            # debug build, SYNC_CHECK=1
 thermal3d.exe        # checks, stack temperatures, benchmark 256 x 256
 build.bat bench      # benchmark build, SYNC_CHECK=0
-thermal3d.exe 512    # benchmark a 512 x 512 grid (GPU only above 256)
+thermal3d.exe 400    # benchmark a 400 x 400 grid (GPU only above 256)
+thermal3d_float.exe 800   # the float version, to see the precision failure
 ```
 CMake alternative:
 ```
@@ -59,8 +71,8 @@ cmake --build build --config Release
 ## Roadmap
 1. ~~2D CPU Jacobi reference~~
 2. ~~CUDA Jacobi kernels: naive and shared-memory tiled~~
-3. ~~3D layered stack, steady state, PCG solver~~ (here). Jacobi needed ~90x more
-   iterations than PCG on this stack, so the implicit solver moved up.
+3. ~~3D layered stack, steady state, PCG solver in double~~ (here). Jacobi needed
+   ~90x more iterations than PCG on this stack, so the implicit solver moved up.
 4. Transient: backward Euler time stepping with PCG
 5. Faster PCG: keep scalars on the GPU, fuse kernels, better preconditioner
 6. Power maps from file, TSVs, anisotropic layers

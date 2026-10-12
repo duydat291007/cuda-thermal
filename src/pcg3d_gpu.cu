@@ -15,7 +15,7 @@
 // Per-plane conductances. Every thread in a block works on the same plane, so
 // constant memory serves each read to the whole warp at once.
 struct PlaneParams {
-    float gx[MAXZ], gy[MAXZ], gzd[MAXZ], gzu[MAXZ];
+    Real gx[MAXZ], gy[MAXZ], gzd[MAXZ], gzu[MAXZ];
 };
 __constant__ PlaneParams c_pp;
 
@@ -44,24 +44,24 @@ __device__ void block_sum_to(double v, double* scratch, double* out) {
     }
 }
 
-__global__ void k_invdiag(float* invd, int nx, int ny) {
+__global__ void k_invdiag(Real* invd, int nx, int ny) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     int l = blockIdx.z;
     if (i >= nx || j >= ny) return;
     invd[((size_t)l * ny + j) * nx + i] =
-        1.0f / diag_cell(i, j, nx, ny, c_pp.gx[l], c_pp.gy[l], c_pp.gzd[l], c_pp.gzu[l]);
+        Real(1) / diag_cell(i, j, nx, ny, c_pp.gx[l], c_pp.gy[l], c_pp.gzd[l], c_pp.gzu[l]);
 }
 
 // r = b, z = M^-1 r, p = z, x = 0;  dots[0] += r . z, dots[1] += b . b
-__global__ void k_init(const float* __restrict__ b, const float* __restrict__ invd,
-                       float* x, float* r, float* z, float* p, size_t n, double* dots) {
+__global__ void k_init(const Real* __restrict__ b, const Real* __restrict__ invd,
+                       Real* x, Real* r, Real* z, Real* p, size_t n, double* dots) {
     __shared__ double s0[32], s1[32];
     size_t c = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     double rz = 0.0, bb = 0.0;
     if (c < n) {
-        float bi = b[c], zi = bi * invd[c];
-        x[c] = 0.0f; r[c] = bi; z[c] = zi; p[c] = zi;
+        Real bi = b[c], zi = bi * invd[c];
+        x[c] = 0; r[c] = bi; z[c] = zi; p[c] = zi;
         rz = (double)bi * zi;
         bb = (double)bi * bi;
     }
@@ -70,7 +70,7 @@ __global__ void k_init(const float* __restrict__ b, const float* __restrict__ in
 }
 
 // Ap = A p;  *pAp += p . Ap
-__global__ void k_apply(const float* __restrict__ p, float* __restrict__ Ap,
+__global__ void k_apply(const Real* __restrict__ p, Real* __restrict__ Ap,
                         int nx, int ny, int nz, double* pAp) {
     __shared__ double s[32];
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -79,7 +79,7 @@ __global__ void k_apply(const float* __restrict__ p, float* __restrict__ Ap,
     double v = 0.0;
     if (i < nx && j < ny) {
         size_t id = ((size_t)l * ny + j) * nx + i;
-        float a = apply_cell(p, i, j, l, nx, ny, nz,
+        Real a = apply_cell(p, i, j, l, nx, ny, nz,
                              c_pp.gx[l], c_pp.gy[l], c_pp.gzd[l], c_pp.gzu[l]);
         Ap[id] = a;
         v = (double)p[id] * a;
@@ -88,16 +88,16 @@ __global__ void k_apply(const float* __restrict__ p, float* __restrict__ Ap,
 }
 
 // x += alpha p, r -= alpha Ap, z = M^-1 r;  dots[0] += r . z, dots[1] += r . r
-__global__ void k_update(float alpha, const float* __restrict__ p,
-                         const float* __restrict__ Ap, const float* __restrict__ invd,
-                         float* x, float* r, float* z, size_t n, double* dots) {
+__global__ void k_update(Real alpha, const Real* __restrict__ p,
+                         const Real* __restrict__ Ap, const Real* __restrict__ invd,
+                         Real* x, Real* r, Real* z, size_t n, double* dots) {
     __shared__ double s0[32], s1[32];
     size_t c = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     double rz = 0.0, rr = 0.0;
     if (c < n) {
         x[c] += alpha * p[c];
-        float ri = r[c] - alpha * Ap[c];
-        float zi = ri * invd[c];
+        Real ri = r[c] - alpha * Ap[c];
+        Real zi = ri * invd[c];
         r[c] = ri; z[c] = zi;
         rz = (double)ri * zi;
         rr = (double)ri * ri;
@@ -107,7 +107,7 @@ __global__ void k_update(float alpha, const float* __restrict__ p,
 }
 
 // p = z + beta p
-__global__ void k_update_p(float beta, const float* __restrict__ z, float* p, size_t n) {
+__global__ void k_update_p(Real beta, const Real* __restrict__ z, Real* p, size_t n) {
     size_t c = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (c < n) p[c] = z[c] + beta * p[c];
 }
@@ -115,13 +115,14 @@ __global__ void k_update_p(float beta, const float* __restrict__ z, float* p, si
 SolveResult gpu_pcg(const Model3D& m, double tol, int maxit) {
     const int nx = m.nx, ny = m.ny, nz = m.nz;
     const size_t n = m.ncells();
-    const size_t bytes = n * sizeof(float);
+    const size_t bytes = n * sizeof(Real);
 
     PlaneParams pp = {};
     for (int l = 0; l < nz; ++l) {
-        pp.gx[l] = m.gx[l]; pp.gy[l] = m.gy[l];
-        pp.gzd[l] = m.gzd[l]; pp.gzu[l] = m.gzu[l];
+        pp.gx[l] = (Real)m.gx[l]; pp.gy[l] = (Real)m.gy[l];
+        pp.gzd[l] = (Real)m.gzd[l]; pp.gzu[l] = (Real)m.gzu[l];
     }
+    std::vector<Real> b_host = to_real(m.P);
 
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
@@ -129,7 +130,7 @@ SolveResult gpu_pcg(const Model3D& m, double tol, int maxit) {
     CUDA_CHECK(cudaEventRecord(start));
 
     CUDA_CHECK(cudaMemcpyToSymbol(c_pp, &pp, sizeof(pp)));
-    float *b, *x, *r, *z, *p, *Ap, *invd;
+    Real *b, *x, *r, *z, *p, *Ap, *invd;
     double* dots;  // [0] r.z  [1] r.r (or b.b at init)  [2] p.Ap
     CUDA_CHECK(cudaMalloc(&b, bytes));
     CUDA_CHECK(cudaMalloc(&x, bytes));
@@ -139,7 +140,7 @@ SolveResult gpu_pcg(const Model3D& m, double tol, int maxit) {
     CUDA_CHECK(cudaMalloc(&Ap, bytes));
     CUDA_CHECK(cudaMalloc(&invd, bytes));
     CUDA_CHECK(cudaMalloc(&dots, 3 * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(b, m.P.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(b, b_host.data(), bytes, cudaMemcpyHostToDevice));
 
     dim3 sblock(TBX, TBY);
     dim3 sgrid((nx + TBX - 1) / TBX, (ny + TBY - 1) / TBY, nz);
@@ -165,7 +166,7 @@ SolveResult gpu_pcg(const Model3D& m, double tol, int maxit) {
         KERNEL_CHECK();
         double pAp;
         CUDA_CHECK(cudaMemcpy(&pAp, &dots[2], sizeof(double), cudaMemcpyDeviceToHost));
-        float alpha = (float)(rz / pAp);
+        Real alpha = (Real)(rz / pAp);
 
         k_update<<<egrid, TB1>>>(alpha, p, Ap, invd, x, r, z, n, dots);
         KERNEL_CHECK();
@@ -176,7 +177,7 @@ SolveResult gpu_pcg(const Model3D& m, double tol, int maxit) {
         res.relres = std::sqrt(rr / bb);
         if (res.relres < tol) { res.converged = true; break; }
 
-        float beta = (float)(rz_new / rz);
+        Real beta = (Real)(rz_new / rz);
         rz = rz_new;
         k_update_p<<<egrid, TB1>>>(beta, z, p, n);
         KERNEL_CHECK();
@@ -190,7 +191,7 @@ SolveResult gpu_pcg(const Model3D& m, double tol, int maxit) {
     CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
     res.ms = ms;
 
-    for (float* ptr : {b, x, r, z, p, Ap, invd}) CUDA_CHECK(cudaFree(ptr));
+    for (Real* ptr : {b, x, r, z, p, Ap, invd}) CUDA_CHECK(cudaFree(ptr));
     CUDA_CHECK(cudaFree(dots));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
