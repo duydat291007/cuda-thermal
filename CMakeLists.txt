@@ -13,3 +13,9 @@ add_executable(thermal2d
     src/gpu_jacobi.cu
     src/cpu_jacobi.cpp)
 target_compile_definitions(thermal2d PRIVATE SYNC_CHECK=${SYNC_CHECK})
+
+add_executable(thermal3d
+    src/main3d.cu
+    src/pcg3d_gpu.cu
+    src/pcg3d_cpu.cpp)
+target_compile_definitions(thermal3d PRIVATE SYNC_CHECK=${SYNC_CHECK})
