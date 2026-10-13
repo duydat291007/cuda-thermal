@@ -127,7 +127,9 @@ private:
         float *gE = nullptr, *gN = nullptr, *gU = nullptr, *gB = nullptr, *cap = nullptr;
         MgReal *fcp = nullptr, *finv = nullptr;  // column factors (depend on dt)
         MgReal *x = nullptr, *b = nullptr;
-        CellOp<float> op() const { return {nx, ny, nz, gE, gN, gU, gB, cap}; }
+        CellOp<float> op() const { return {nx, ny, nz, gE, gN, gU, gB, cap}; }         // natural
+        CellOp<float, true> sop() const { return {nx, ny, nz, gE, gN, gU, gB, cap}; }  // color-split
+        size_t cells() const { return (size_t)nz * sop().plane(); }  // split, with padding
     };
 
     Precond pc_;
@@ -135,12 +137,14 @@ private:
     Real inv_dt_ = 0;
     Real *P_ = nullptr, *x_ = nullptr, *b_ = nullptr, *r_ = nullptr, *z_ = nullptr,
          *p_ = nullptr, *Ap_ = nullptr, *invd_ = nullptr;
+    Real* diag_ = nullptr;               // diagonal of (A + C/dt), recomputed in set_dt
     double* sc_ = nullptr;               // device scalars: dot products, alpha, beta, 1/dt
     double* h_sc_ = nullptr;             // pinned host copy
     CUstream_st* s_ = nullptr;           // the solver's stream (cudaStream_t)
     CUgraphExec_st* graph_a_ = nullptr;  // recorded iteration parts (cudaGraphExec_t)
     CUgraphExec_st* graph_b_ = nullptr;
-    std::vector<Level> levels_;          // level 0 holds the fine operator in both modes
+    Level fine_;                         // fine operator, natural layout (PCG)
+    std::vector<Level> levels_;          // multigrid levels, color-split layout, finest first
 };
 
 // GPU multigrid iterations are replayed from CUDA graphs by default. Pass false before

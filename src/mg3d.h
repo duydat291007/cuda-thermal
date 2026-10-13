@@ -34,22 +34,23 @@
 #include "operator3d.h"
 #include "stack3d.h"
 
-// One level: its operator plus the precomputed column factors.
-template <class G, class R>
+// One level: its operator (either memory layout, see operator3d.h) plus the
+// precomputed column factors, stored in the same layout.
+template <class Op, class R>
 struct MgGrid {
-    CellOp<G> op;
+    Op op;
     const R *fcp, *finv;  // per cell: Thomas upper factor, 1 / pivot
 };
 
 // Factors the tridiagonal matrix of column (i, j) (Thomas algorithm).
-template <class G, class R>
-HD inline void mg_factor_column(const CellOp<G>& o, R inv_dt, R* fcp, R* finv, int i, int j) {
-    const size_t sxy = (size_t)o.nx * o.ny;
-    const size_t col = (size_t)j * o.nx + i;
+template <class Op, class R>
+HD inline void mg_factor_column(const Op& o, R inv_dt, R* fcp, R* finv, int i, int j) {
+    const size_t sxy = o.plane();
+    const size_t col = o.col(i, j);
     R cp_prev = 0;
     for (int l = 0; l < o.nz; ++l) {
         const size_t id = (size_t)l * sxy + col;
-        const R d = op_diag<G, R>(o, id, i, j, l, inv_dt);
+        const R d = op_diag<Op, R>(o, i, j, l, inv_dt);
         const R lower = (l > 0) ? -(R)o.gU[id - sxy] : R(0);
         const R upper = (l < o.nz - 1) ? -(R)o.gU[id] : R(0);
         const R inv = R(1) / (d - lower * cp_prev);
@@ -63,15 +64,15 @@ HD inline void mg_factor_column(const CellOp<G>& o, R inv_dt, R* fcp, R* finv, i
 // using the precomputed factors. The forward pass writes its intermediate
 // values straight into x, then the back substitution finishes in place, so no
 // scratch arrays and no divisions are needed.
-template <class G, class R>
-HD inline void mg_line_solve(const MgGrid<G, R>& g, const R* b, R* x, int i, int j) {
-    const CellOp<G>& o = g.op;
-    const size_t sxy = (size_t)o.nx * o.ny;
-    const size_t col = (size_t)j * o.nx + i;
+template <class Op, class R>
+HD inline void mg_line_solve(const MgGrid<Op, R>& g, const R* b, R* x, int i, int j) {
+    const Op& o = g.op;
+    const size_t sxy = o.plane();
+    const size_t col = o.col(i, j);
     R prev = 0;
     for (int l = 0; l < o.nz; ++l) {
         const size_t id = (size_t)l * sxy + col;
-        const R s = b[id] + op_lat_sum(o, x, id, i, j);
+        const R s = b[id] + op_lat_sum(o, x, i, j, l);
         const R lower = (l > 0) ? -(R)o.gU[id - sxy] : R(0);
         prev = (s - lower * prev) * g.finv[id];
         x[id] = prev;

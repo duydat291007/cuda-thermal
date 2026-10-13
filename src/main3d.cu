@@ -16,6 +16,9 @@
 //   thermal3d compare3dice <folder> <cell_um> <dir>
 //                              solve the case on the same grid and compare with
 //                              the 3D-ICE results (tmap_L*.txt, tflp_*.txt) in dir
+//   thermal3d profile [n]      one multigrid GPU solve on an n x n grid (default
+//                              800) and nothing else, for profilers (nsys, ncu):
+//                              the first launch of each kernel is on the fine grid
 // Compiled with -DREAL_FLOAT the solver runs in float, to show why it shouldn't.
 #include <algorithm>
 #include <cmath>
@@ -610,6 +613,15 @@ int main(int argc, char** argv) {
         return compare_case_3dice(argv[2], atof(argv[3]), argv[4]);
     if (argc >= 3 && strcmp(argv[1], "case") == 0) {
         return run_case(argv[2], argc >= 4 ? atoi(argv[3]) : 200);
+    }
+    if (argc >= 2 && strcmp(argv[1], "profile") == 0) {
+        int n = argc >= 3 ? atoi(argv[2]) : 800;
+        Model3D m = hotspot_model(n);
+        SolveResult g = gpu_pcg(m, kTol, kMaxIt, Precond::Multigrid);
+        printf("profile: %d x %d x %d, %d multigrid iterations, setup %.1f ms, solve %.2f ms "
+               "(%.3f ms / iteration)\n", n, n, m.nz, g.iters, g.setup_ms, g.solve_ms,
+               g.solve_ms / g.iters);
+        return 0;
     }
     if (argc >= 2 && strcmp(argv[1], "transient") == 0) {
         int n = argc >= 3 ? atoi(argv[2]) : 200;

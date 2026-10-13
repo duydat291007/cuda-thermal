@@ -44,7 +44,7 @@ void CpuPcg::set_dt(double dt) {
         for (int j = 0; j < m_.ny; ++j)
             for (int i = 0; i < m_.nx; ++i) {
                 size_t id = m_.idx(i, j, l);
-                invd_[id] = Real(1) / op_diag<float, Real>(op_, id, i, j, l, inv_dt_);
+                invd_[id] = Real(1) / op_diag<CellOp<float>, Real>(op_, i, j, l, inv_dt_);
             }
     // Multigrid column factors for every level.
     const MgReal mg_inv_dt = (MgReal)inv_dt_;
@@ -70,7 +70,7 @@ void CpuPcg::vcycle(size_t k) {
     Level& L = levels_[k];
     std::fill(L.x.begin(), L.x.end(), MgReal(0));
     const MgReal inv_dt = (MgReal)inv_dt_;
-    const MgGrid<float, MgReal> g{L.op(), L.fcp.data(), L.finv.data()};
+    const MgGrid<CellOp<float>, MgReal> g{L.op(), L.fcp.data(), L.finv.data()};
     auto sweep = [&](int color) {  // red-black: columns with (i + j) % 2 == color
         for (int j = 0; j < L.ny; ++j)
             for (int i = 0; i < L.nx; ++i)

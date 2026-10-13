@@ -88,6 +88,25 @@ faster, so only multigrid uses them. Graph replay matches direct launches to
 Transient, 200 x 200, 107 steps to 2 s: 842 PCG iterations, 522 ms of solving
 (0.62 ms per iteration).
 
+**Profiling-driven kernel optimization (Nsight Systems + Nsight Compute).**
+`thermal3d profile 800` runs one 800 x 800 x 10 multigrid solve and nothing else.
+Nsight Systems (with `--cuda-graph-trace=node`, since most kernels run inside
+graphs) gave the time per kernel; Nsight Compute then showed why each was slow.
+RTX 4060 laptop GPU, ~256 GB/s DRAM, FP64 at 1/64 of the FP32 rate.
+
+| step | what Nsight Compute showed | change | result |
+|---|---|---|---|
+| 1 | `k_apply` (A p, 20% of the time): FP64 pipe 86.7% busy, DRAM only 40%. Each cell rebuilt the diagonal: 7 float-to-double conversions and 7 additions | diagonal stored once per time step (same formula, same bits), read by `k_apply` and `k_residual` | `k_apply` 2.65 -> 1.61 ms, DRAM 40% -> 72%. Also: the Jacobi-only 1/diagonal (an FP64 division per cell, 2 ms per time-step change) is skipped for multigrid |
+| 2 | vector kernels already at 75-80% of DRAM bandwidth | z = M^-1 r is not stored; the next kernels read the float V-cycle result directly | ~3% |
+| 3 | smoother `k_mg_sweep` (40% of the time): DRAM at **96%** of peak, compute 9%. Bandwidth-bound and saturated, so only moving fewer bytes helps. In red-black order a warp touched every other column, so half of each 32-byte sector it fetched was the other color's data | color-split layout for all multigrid levels: each row stores its red columns, then its black ones (`operator3d.h`), so a sweep reads contiguous memory | fine sweep 827 -> 514 us (still 94% of DRAM bandwidth, 203 -> 124 MB moved) |
+
+800 x 800 solve: **106 -> 96 -> 93 -> 78 ms** (1.37x), with identical answers:
+the stencil and line-solve code is written once for both layouts, a host test
+showed the V-cycle bitwise equal in both, and the GPU (split layout) still
+matches the CPU multigrid (natural layout) to 1e-15. Cost: setup at 800 x 800
+went from ~96 to ~170 ms, because the host now rearranges the level arrays
+before uploading them (once per solver).
+
 **Mixed precision:** PCG runs in double, the multigrid V-cycle in float. The
 V-cycle only proposes a search direction and PCG measures its effect in double,
 so float rounding in the preconditioner never accumulates in the solution (unlike
@@ -193,6 +212,7 @@ thermal3d.exe case cases\tsv_under_core0 200
 mkdir cases\validate_3dice\ice100
 thermal3d.exe export3dice cases\validate_3dice 100 cases\validate_3dice\ice100
    (run 3D-ICE-Emulator case.stk in that folder, from WSL)
+thermal3d.exe profile 800      # one multigrid solve only, for nsys / ncu
 thermal3d.exe compare3dice cases\validate_3dice 100 cases\validate_3dice\ice100
    (same three steps with cases\validate_tsv to validate the TSV regions)
 thermal3d_float.exe 800   # the float version, to see the precision failure
@@ -226,9 +246,9 @@ cmake --build build --config Release
    ~90x more iterations than PCG on this stack, so the implicit solver moved up.
 4. ~~Transient: backward Euler time stepping with PCG~~
 5. ~~Multigrid preconditioner~~, ~~profiled and optimized~~, ~~float V-cycle in
-   double PCG~~, ~~PCG scalars on the GPU, CUDA graphs~~. Next for speed: the
-   kernels themselves at large grids (fewer or fused sweeps), and building the
-   multigrid levels on the GPU (setup equals the solve time at 800 x 800)
+   double PCG~~, ~~PCG scalars on the GPU, CUDA graphs~~, ~~Nsight Compute
+   driven: FP64 diagonal, color-split multigrid layout~~. Next for speed: build
+   the multigrid levels on the GPU (setup is ~2x the solve time at 800 x 800)
 6. ~~Power maps from files, TSVs (per-cell anisotropic materials)~~
 7. ~~Validate against 3D-ICE~~, ~~including TSV regions~~ (here): agreement to
    its output precision
