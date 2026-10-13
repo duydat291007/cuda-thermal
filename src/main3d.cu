@@ -621,6 +621,10 @@ int main(int argc, char** argv) {
         printf("profile: %d x %d x %d, %d multigrid iterations, setup %.1f ms, solve %.2f ms "
                "(%.3f ms / iteration)\n", n, n, m.nz, g.iters, g.setup_ms, g.solve_ms,
                g.solve_ms / g.iters);
+        const GpuSetupTimes t = gpu_last_setup();
+        printf("  setup: allocate %.1f, upload %.1f, multigrid levels %.1f, factors %.1f, "
+               "graphs %.1f ms (rest: host side, e.g. freeing)\n", t.alloc_ms, t.upload_ms,
+               t.levels_ms, t.factor_ms, t.graphs_ms);
         return 0;
     }
     if (argc >= 2 && strcmp(argv[1], "transient") == 0) {

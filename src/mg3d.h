@@ -91,6 +91,58 @@ struct MgLevelHost {
     std::vector<float> gE, gN, gU, gB, cap;
 };
 
+// One coarse cell (I, J, l) of a cnx x cny level from its (up to) 2 x 2 fine
+// children (natural layout), shared by the CPU builder below and the GPU one
+// (k_coarsen), so both produce bit-identical coarse operators. Vertical faces,
+// ambient links and capacities add up (in double); fine lateral faces crossing
+// a coarse face add up and are scaled by (fine center distance / coarse center
+// distance). fdx, fdy, cdx, cdy: fine and coarse cell widths.
+HD inline void mg_coarse_cell(const CellOp<float>& f, const double* fdx, const double* fdy,
+                              const double* cdx, const double* cdy, int cnx, int cny, int I,
+                              int J, int l, float* cgE, float* cgN, float* cgU, float* ccap,
+                              float* cgB) {
+    const size_t fxy = (size_t)f.nx * f.ny, cxy = (size_t)cnx * cny;
+    const size_t cid = (size_t)l * cxy + (size_t)J * cnx + I;
+    const int i0 = 2 * I, i1 = (2 * I + 1 < f.nx - 1) ? 2 * I + 1 : f.nx - 1;
+    const int j0 = 2 * J, j1 = (2 * J + 1 < f.ny - 1) ? 2 * J + 1 : f.ny - 1;
+    double gu = 0, cp = 0, gb = 0;
+    for (int j = j0; j <= j1; ++j)
+        for (int i = i0; i <= i1; ++i) {
+            const size_t fid = (size_t)l * fxy + (size_t)j * f.nx + i;
+            gu += f.gU[fid];
+            cp += f.cap[fid];
+            if (l == 0) gb += f.gB[(size_t)j * f.nx + i];
+        }
+    cgU[cid] = (float)gu;
+    ccap[cid] = (float)cp;
+    if (l == 0) cgB[(size_t)J * cnx + I] = (float)gb;
+    float e = 0.0f, n = 0.0f;
+    if (I < cnx - 1) {  // fine faces between columns 2I+1 and 2I+2
+        double sum = 0;
+        for (int j = j0; j <= j1; ++j) sum += f.gE[(size_t)l * fxy + (size_t)j * f.nx + 2 * I + 1];
+        double df = 0.5 * (fdx[2 * I + 1] + fdx[2 * I + 2]);
+        double dc = 0.5 * (cdx[I] + cdx[I + 1]);
+        e = (float)(sum * df / dc);
+    }
+    if (J < cny - 1) {  // fine faces between rows 2J+1 and 2J+2
+        double sum = 0;
+        for (int i = i0; i <= i1; ++i) sum += f.gN[(size_t)l * fxy + (size_t)(2 * J + 1) * f.nx + i];
+        double df = 0.5 * (fdy[2 * J + 1] + fdy[2 * J + 2]);
+        double dc = 0.5 * (cdy[J] + cdy[J + 1]);
+        n = (float)(sum * df / dc);
+    }
+    cgE[cid] = e;
+    cgN[cid] = n;
+}
+
+// Widths of the next coarser level's cells (pairs of fine cells merged).
+inline std::vector<double> mg_coarse_widths(const std::vector<double>& f) {
+    std::vector<double> c;
+    const int n = (int)f.size();
+    for (int I = 0; I < (n + 1) / 2; ++I) c.push_back(f[2 * I] + (2 * I + 1 < n ? f[2 * I + 1] : 0.0));
+    return c;
+}
+
 // All levels, finest (the model's own operator) first, down to 1 x 1.
 inline std::vector<MgLevelHost> mg_build_levels(const Model3D& m) {
     std::vector<MgLevelHost> L(1);
@@ -110,49 +162,21 @@ inline std::vector<MgLevelHost> mg_build_levels(const Model3D& m) {
         c.nx = (f.nx + 1) / 2;
         c.ny = (f.ny + 1) / 2;
         c.nz = f.nz;
-        for (int I = 0; I < c.nx; ++I)
-            c.dx.push_back(f.dx[2 * I] + (2 * I + 1 < f.nx ? f.dx[2 * I + 1] : 0.0));
-        for (int J = 0; J < c.ny; ++J)
-            c.dy.push_back(f.dy[2 * J] + (2 * J + 1 < f.ny ? f.dy[2 * J + 1] : 0.0));
-        const size_t fxy = (size_t)f.nx * f.ny, cxy = (size_t)c.nx * c.ny;
-        const size_t cn = cxy * c.nz;
+        c.dx = mg_coarse_widths(f.dx);
+        c.dy = mg_coarse_widths(f.dy);
+        const size_t cn = (size_t)c.nx * c.ny * c.nz;
         c.gE.assign(cn, 0.0f);
         c.gN.assign(cn, 0.0f);
         c.gU.assign(cn, 0.0f);
         c.cap.assign(cn, 0.0f);
-        c.gB.assign(cxy, 0.0f);
+        c.gB.assign((size_t)c.nx * c.ny, 0.0f);
+        const CellOp<float> fo{f.nx, f.ny, f.nz, f.gE.data(), f.gN.data(), f.gU.data(), f.gB.data(), f.cap.data()};
         for (int l = 0; l < c.nz; ++l)
             for (int J = 0; J < c.ny; ++J)
-                for (int I = 0; I < c.nx; ++I) {
-                    const size_t cid = (size_t)l * cxy + (size_t)J * c.nx + I;
-                    const int i0 = 2 * I, i1 = std::min(2 * I + 1, f.nx - 1);
-                    const int j0 = 2 * J, j1 = std::min(2 * J + 1, f.ny - 1);
-                    double gu = 0, cp = 0, gb = 0;
-                    for (int j = j0; j <= j1; ++j)
-                        for (int i = i0; i <= i1; ++i) {
-                            const size_t fid = (size_t)l * fxy + (size_t)j * f.nx + i;
-                            gu += f.gU[fid];
-                            cp += f.cap[fid];
-                            if (l == 0) gb += f.gB[(size_t)j * f.nx + i];
-                        }
-                    c.gU[cid] = (float)gu;
-                    c.cap[cid] = (float)cp;
-                    if (l == 0) c.gB[(size_t)J * c.nx + I] = (float)gb;
-                    if (I < c.nx - 1) {  // fine faces between columns 2I+1 and 2I+2
-                        double s = 0;
-                        for (int j = j0; j <= j1; ++j) s += f.gE[(size_t)l * fxy + (size_t)j * f.nx + 2 * I + 1];
-                        double df = 0.5 * (f.dx[2 * I + 1] + f.dx[2 * I + 2]);
-                        double dc = 0.5 * (c.dx[I] + c.dx[I + 1]);
-                        c.gE[cid] = (float)(s * df / dc);
-                    }
-                    if (J < c.ny - 1) {  // fine faces between rows 2J+1 and 2J+2
-                        double s = 0;
-                        for (int i = i0; i <= i1; ++i) s += f.gN[(size_t)l * fxy + (size_t)(2 * J + 1) * f.nx + i];
-                        double df = 0.5 * (f.dy[2 * J + 1] + f.dy[2 * J + 2]);
-                        double dc = 0.5 * (c.dy[J] + c.dy[J + 1]);
-                        c.gN[cid] = (float)(s * df / dc);
-                    }
-                }
+                for (int I = 0; I < c.nx; ++I)
+                    mg_coarse_cell(fo, f.dx.data(), f.dy.data(), c.dx.data(), c.dy.data(), c.nx,
+                                   c.ny, I, J, l, c.gE.data(), c.gN.data(), c.gU.data(),
+                                   c.cap.data(), c.gB.data());
         L.push_back(std::move(c));
     }
     return L;

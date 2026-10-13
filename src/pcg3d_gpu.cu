@@ -31,7 +31,9 @@
 // the temperature field back to the host when it asks for it. All work runs on
 // the solver's own stream (graphs can only be recorded from a non-default one).
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <type_traits>
 #include "cuda_check.h"
 #include "mg3d.h"
 #include "operator3d.h"
@@ -81,6 +83,9 @@ enum { S_RZ, S_RZNEW, S_RR, S_PAP, S_BB, S_ALPHA, S_BETA, S_INVDT, NSC };
 // Graph replay on (default) or off; see gpu_use_graphs() in pcg3d.h.
 static bool g_use_graphs = true;
 void gpu_use_graphs(bool on) { g_use_graphs = on; }
+
+static GpuSetupTimes g_last_setup;
+GpuSetupTimes gpu_last_setup() { return g_last_setup; }
 
 // Diagonal of (A + C/dt), stored once per time step; for Jacobi also its
 // inverse (one FP64 division per cell, so multigrid skips it: invd == nullptr).
@@ -307,6 +312,30 @@ __global__ void k_mg_prolong(SOp f, MgReal* fx, SOp co, const MgReal* __restrict
     fx[f.idx(i, j, l)] += cx[co.idx(i / 2, j / 2, l)];
 }
 
+// ---- setup kernels: multigrid levels built on the GPU ------------------------
+
+// Coarse level from the fine one, natural layout: one thread per coarse cell,
+// the same code as the CPU builder (mg_coarse_cell in mg3d.h).
+__global__ void k_coarsen(Op f, const double* __restrict__ fdx, const double* __restrict__ fdy,
+                          const double* __restrict__ cdx, const double* __restrict__ cdy,
+                          int cnx, int cny, float* cgE, float* cgN, float* cgU, float* ccap,
+                          float* cgB) {
+    int I = blockIdx.x * blockDim.x + threadIdx.x;
+    int J = blockIdx.y * blockDim.y + threadIdx.y;
+    int l = blockIdx.z;
+    if (I >= cnx || J >= cny) return;
+    mg_coarse_cell(f, fdx, fdy, cdx, cdy, cnx, cny, I, J, l, cgE, cgN, cgU, ccap, cgB);
+}
+
+// Natural -> color-split copy of one array with `planes` z-planes.
+__global__ void k_to_split(SOp s, int planes, const float* __restrict__ in, float* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int l = blockIdx.z;
+    if (i >= s.nx || j >= s.ny || l >= planes) return;
+    out[s.idx(i, j, l)] = in[((size_t)l * s.ny + j) * s.nx + i];
+}
+
 // ---------------------------------------------------------------------------
 
 static dim3 block2d() { return dim3(TBX, TBY); }
@@ -319,6 +348,12 @@ GpuPcg::GpuPcg(const Model3D& m, Precond pc) : pc_(pc), n_(m.ncells()) {
         fprintf(stderr, "Model3D used before finalize()\n");
         exit(1);
     }
+    using clk = std::chrono::high_resolution_clock;
+    auto ms_since = [](clk::time_point t) {
+        return std::chrono::duration<double, std::milli>(clk::now() - t).count();
+    };
+    auto t0 = clk::now();
+
     // A blocking stream: it waits for the plain cudaMemcpy uploads below, which
     // run on the default stream.
     CUDA_CHECK(cudaStreamCreate(&s_));
@@ -330,57 +365,113 @@ GpuPcg::GpuPcg(const Model3D& m, Precond pc) : pc_(pc), n_(m.ncells()) {
     CUDA_CHECK(cudaMalloc(&sc_, NSC * sizeof(double)));
     CUDA_CHECK(cudaMemset(sc_, 0, NSC * sizeof(double)));
     CUDA_CHECK(cudaMallocHost(&h_sc_, NSC * sizeof(double)));  // pinned: async copies, graphs
+    CUDA_CHECK(cudaDeviceSynchronize());
+    setup_.alloc_ms = ms_since(t0);
+    t0 = clk::now();
 
-    // Operators: the fine one in natural layout for PCG; for multigrid, every
-    // level (the fine one again) in color-split layout.
-    std::vector<MgLevelHost> hosts = mg_build_levels(m);
+    // The fine operator, natural layout, straight from the model (used by PCG).
     auto upload = [](const std::vector<float>& v, float** dst) {
         CUDA_CHECK(cudaMalloc(dst, v.size() * sizeof(float)));
         CUDA_CHECK(cudaMemcpy(*dst, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice));
     };
-    {
-        const MgLevelHost& h = hosts[0];
-        fine_.nx = h.nx;
-        fine_.ny = h.ny;
-        fine_.nz = h.nz;
-        upload(h.gE, &fine_.gE);
-        upload(h.gN, &fine_.gN);
-        upload(h.gU, &fine_.gU);
-        upload(h.gB, &fine_.gB);
-        upload(h.cap, &fine_.cap);
+    fine_.nx = m.nx;
+    fine_.ny = m.ny;
+    fine_.nz = m.nz;
+    upload(m.gE, &fine_.gE);
+    upload(m.gN, &fine_.gN);
+    upload(m.gU, &fine_.gU);
+    upload(m.gB, &fine_.gB);
+    upload(m.cap, &fine_.cap);
+    // Real is double by default, like m.P: upload it directly, without a copy.
+    if constexpr (std::is_same<Real, double>::value) {
+        CUDA_CHECK(cudaMemcpy(P_, m.P.data(), bytes, cudaMemcpyHostToDevice));
+    } else {
+        std::vector<Real> P = to_real(m.P);
+        CUDA_CHECK(cudaMemcpy(P_, P.data(), bytes, cudaMemcpyHostToDevice));
     }
-    if (pc_ == Precond::Multigrid)
-        for (const MgLevelHost& h : hosts) {
-            Level L;
-            L.nx = h.nx;
-            L.ny = h.ny;
-            L.nz = h.nz;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    setup_.upload_ms = ms_since(t0);
+    t0 = clk::now();
+
+    // Multigrid levels, built on the GPU: coarsen in the natural layout (level 0
+    // is fine_), then copy every level into the color-split layout.
+    if (pc_ == Precond::Multigrid) {
+        Level nat = fine_;                       // current level, natural layout
+        std::vector<double> dx(m.nx, m.dx), dy(m.ny, m.dy);
+        double *d_dx = nullptr, *d_dy = nullptr;
+        auto upload_d = [](const std::vector<double>& v, double** dst) {
+            CUDA_CHECK(cudaMalloc(dst, v.size() * sizeof(double)));
+            CUDA_CHECK(cudaMemcpy(*dst, v.data(), v.size() * sizeof(double), cudaMemcpyHostToDevice));
+        };
+        upload_d(dx, &d_dx);
+        upload_d(dy, &d_dy);
+        while (true) {
+            Level L;                             // the split copy of `nat`
+            L.nx = nat.nx;
+            L.ny = nat.ny;
+            L.nz = nat.nz;
             const SOp so = L.sop();
-            auto to_split = [&](const std::vector<float>& v, int planes) {
-                std::vector<float> out((size_t)planes * so.plane(), 0.0f);  // padding stays 0
-                for (int l = 0; l < planes; ++l)
-                    for (int j = 0; j < h.ny; ++j)
-                        for (int i = 0; i < h.nx; ++i)
-                            out[so.idx(i, j, l)] = v[((size_t)l * h.ny + j) * h.nx + i];
-                return out;
-            };
-            upload(to_split(h.gE, h.nz), &L.gE);
-            upload(to_split(h.gN, h.nz), &L.gN);
-            upload(to_split(h.gU, h.nz), &L.gU);
-            upload(to_split(h.gB, 1), &L.gB);
-            upload(to_split(h.cap, h.nz), &L.cap);
-            const size_t lb = L.cells() * sizeof(MgReal);
+            const size_t lc = L.cells(), lcol = so.plane();
+            for (float** ptr : {&L.gE, &L.gN, &L.gU, &L.cap}) {
+                CUDA_CHECK(cudaMalloc(ptr, lc * sizeof(float)));
+                CUDA_CHECK(cudaMemset(*ptr, 0, lc * sizeof(float)));  // padding stays 0
+            }
+            CUDA_CHECK(cudaMalloc(&L.gB, lcol * sizeof(float)));
+            CUDA_CHECK(cudaMemset(L.gB, 0, lcol * sizeof(float)));
+            const dim3 g3 = grid2d(L.nx, L.ny, L.nz), g1 = grid2d(L.nx, L.ny, 1);
+            k_to_split<<<g3, block2d()>>>(so, L.nz, nat.gE, L.gE);
+            k_to_split<<<g3, block2d()>>>(so, L.nz, nat.gN, L.gN);
+            k_to_split<<<g3, block2d()>>>(so, L.nz, nat.gU, L.gU);
+            k_to_split<<<g3, block2d()>>>(so, L.nz, nat.cap, L.cap);
+            k_to_split<<<g1, block2d()>>>(so, 1, nat.gB, L.gB);
+            KERNEL_CHECK();
             for (MgReal** ptr : {&L.fcp, &L.finv, &L.b, &L.x}) {
-                CUDA_CHECK(cudaMalloc(ptr, lb));
-                CUDA_CHECK(cudaMemset(*ptr, 0, lb));  // padding cells stay 0
+                CUDA_CHECK(cudaMalloc(ptr, lc * sizeof(MgReal)));
+                CUDA_CHECK(cudaMemset(*ptr, 0, lc * sizeof(MgReal)));  // padding stays 0
             }
             levels_.push_back(L);
-        }
+            if (nat.nx == 1 && nat.ny == 1) break;
 
-    std::vector<Real> P = to_real(m.P);
-    CUDA_CHECK(cudaMemcpy(P_, P.data(), bytes, cudaMemcpyHostToDevice));
+            // Next coarser level, natural layout (temporary).
+            Level c;
+            c.nx = (nat.nx + 1) / 2;
+            c.ny = (nat.ny + 1) / 2;
+            c.nz = nat.nz;
+            std::vector<double> cdx = mg_coarse_widths(dx), cdy = mg_coarse_widths(dy);
+            double *d_cdx = nullptr, *d_cdy = nullptr;
+            upload_d(cdx, &d_cdx);
+            upload_d(cdy, &d_cdy);
+            const size_t cn = (size_t)c.nx * c.ny * c.nz, cxy = (size_t)c.nx * c.ny;
+            for (float** ptr : {&c.gE, &c.gN, &c.gU, &c.cap}) CUDA_CHECK(cudaMalloc(ptr, cn * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&c.gB, cxy * sizeof(float)));
+            k_coarsen<<<grid2d(c.nx, c.ny, c.nz), block2d()>>>(nat.op(), d_dx, d_dy, d_cdx, d_cdy,
+                                                               c.nx, c.ny, c.gE, c.gN, c.gU,
+                                                               c.cap, c.gB);
+            KERNEL_CHECK();
+            if (nat.gE != fine_.gE)  // free the previous temporary level (never fine_)
+                for (float* ptr : {nat.gE, nat.gN, nat.gU, nat.gB, nat.cap}) cudaFree(ptr);
+            CUDA_CHECK(cudaFree(d_dx));
+            CUDA_CHECK(cudaFree(d_dy));
+            nat = c;
+            dx.swap(cdx);
+            dy.swap(cdy);
+            d_dx = d_cdx;
+            d_dy = d_cdy;
+        }
+        if (nat.gE != fine_.gE)
+            for (float* ptr : {nat.gE, nat.gN, nat.gU, nat.gB, nat.cap}) cudaFree(ptr);
+        CUDA_CHECK(cudaFree(d_dx));
+        CUDA_CHECK(cudaFree(d_dy));
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    setup_.levels_ms = ms_since(t0);
+    t0 = clk::now();
+
     set_dt(0.0);
     set_x_zero();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    setup_.factor_ms = ms_since(t0);
+    t0 = clk::now();
 
     // Record the two halves of an iteration as graphs. They read 1/dt, alpha and
     // beta from sc_, so they stay valid when the time step changes. Multigrid
@@ -397,6 +488,8 @@ GpuPcg::GpuPcg(const Model3D& m, Precond pc) : pc_(pc), n_(m.ncells()) {
         }
     }
     CUDA_CHECK(cudaStreamSynchronize(s_));
+    setup_.graphs_ms = ms_since(t0);
+    g_last_setup = setup_;
 }
 
 GpuPcg::~GpuPcg() {

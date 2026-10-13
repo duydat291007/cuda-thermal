@@ -98,6 +98,16 @@ private:
     std::vector<Level> levels_;          // multigrid levels, finest first
 };
 
+// Where the GPU solver's setup time goes (ms), for the last GpuPcg built.
+struct GpuSetupTimes {
+    double alloc_ms = 0;    // stream, PCG vectors (cudaMalloc)
+    double upload_ms = 0;   // fine operator and power map to the GPU
+    double levels_ms = 0;   // multigrid levels: coarsen and re-layout, on the GPU
+    double factor_ms = 0;   // diagonal and column factors for dt = 0
+    double graphs_ms = 0;   // record the CUDA graphs
+};
+GpuSetupTimes gpu_last_setup();
+
 // CUDA handle types, declared here so CPU-only code can include this header.
 struct CUstream_st;
 struct CUgraphExec_st;
@@ -144,6 +154,7 @@ private:
     CUgraphExec_st* graph_a_ = nullptr;  // recorded iteration parts (cudaGraphExec_t)
     CUgraphExec_st* graph_b_ = nullptr;
     Level fine_;                         // fine operator, natural layout (PCG)
+    GpuSetupTimes setup_;
     std::vector<Level> levels_;          // multigrid levels, color-split layout, finest first
 };
 

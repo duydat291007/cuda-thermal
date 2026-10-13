@@ -103,9 +103,16 @@ RTX 4060 laptop GPU, ~256 GB/s DRAM, FP64 at 1/64 of the FP32 rate.
 800 x 800 solve: **106 -> 96 -> 93 -> 78 ms** (1.37x), with identical answers:
 the stencil and line-solve code is written once for both layouts, a host test
 showed the V-cycle bitwise equal in both, and the GPU (split layout) still
-matches the CPU multigrid (natural layout) to 1e-15. Cost: setup at 800 x 800
-went from ~96 to ~170 ms, because the host now rearranges the level arrays
-before uploading them (once per solver).
+matches the CPU multigrid (natural layout) to 1e-15.
+
+**Setup on the GPU.** The color-split layout first cost setup time (~96 -> ~170
+ms at 800 x 800: the host rearranged every level before uploading it). Now the
+coarse levels are built on the GPU (one thread per coarse cell, calling the same
+`mg_coarse_cell` as the CPU builder, so the operators are bit-identical), the
+layout change is a GPU kernel, and the fine operator is uploaded once and
+shared with PCG. Setup at 800 x 800: **~170 -> ~44 ms** (upload 16, levels 15,
+allocation 8, factors 2.5, graphs 0.5 ms; `thermal3d profile` prints this
+breakdown). What remains is mostly the 179 MB upload over PCIe.
 
 **Mixed precision:** PCG runs in double, the multigrid V-cycle in float. The
 V-cycle only proposes a search direction and PCG measures its effect in double,
@@ -247,8 +254,8 @@ cmake --build build --config Release
 4. ~~Transient: backward Euler time stepping with PCG~~
 5. ~~Multigrid preconditioner~~, ~~profiled and optimized~~, ~~float V-cycle in
    double PCG~~, ~~PCG scalars on the GPU, CUDA graphs~~, ~~Nsight Compute
-   driven: FP64 diagonal, color-split multigrid layout~~. Next for speed: build
-   the multigrid levels on the GPU (setup is ~2x the solve time at 800 x 800)
+   driven: FP64 diagonal, color-split multigrid layout~~, ~~multigrid setup on
+   the GPU~~
 6. ~~Power maps from files, TSVs (per-cell anisotropic materials)~~
 7. ~~Validate against 3D-ICE~~, ~~including TSV regions~~ (here): agreement to
    its output precision
