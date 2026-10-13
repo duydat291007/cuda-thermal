@@ -52,14 +52,12 @@ TransientResult run_transient(const Model3D& m, const TransientOptions& o) {
     s.set_x_zero();
 
     std::vector<Real> T_old(m.ncells(), Real(0)), T_new;
-    std::vector<double> shift(m.nz);
     double t = 0, dt = o.dt0, last_dt = -1;
 
     while (t < o.t_end * (1 - 1e-12)) {
         dt = std::min(dt, o.t_end - t);
         if (dt != last_dt) {  // C/dt changes, so the matrix and preconditioner change
-            for (int l = 0; l < m.nz; ++l) shift[l] = m.cap[l] / dt;
-            s.set_shift(shift);
+            s.set_dt(dt);
             last_dt = dt;
         }
         s.set_rhs_transient();              // b = P + C/dt * T_old (x still holds T_old)

@@ -1,0 +1,10 @@
+# Power blocks. x, y = lower-left corner. Blocks on the same layer may overlap (powers add).
+name, layer, x_mm, y_mm, w_mm, h_mm, power_W
+core0, Si tier 2 (bottom), 0.5, 0.5, 2.0, 2.0, 6
+core1, Si tier 2 (bottom), 3.0, 0.5, 2.0, 2.0, 6
+core2, Si tier 2 (bottom), 0.5, 3.0, 2.0, 2.0, 6
+core3, Si tier 2 (bottom), 3.0, 3.0, 2.0, 2.0, 6
+l2_cache, Si tier 2 (bottom), 5.5, 0.5, 4.0, 4.5, 3
+noc_io, Si tier 2 (bottom), 0.5, 5.5, 9.0, 4.0, 3
+dram_banks, Si tier 1 (top), 0.0, 0.0, 10.0, 10.0, 12
+dram_ctrl, Si tier 1 (top), 4.0, 4.0, 2.0, 2.0, 3

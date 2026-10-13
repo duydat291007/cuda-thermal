@@ -1,28 +1,37 @@
-// stack3d.h - 3D layered chip stack: geometry, conductances, power maps.
+// stack3d.h - 3D layered chip stack: geometry, materials, TSVs, power maps.
 //
 // Finite-volume model on a cell-centered grid. Laterally the die is split into
 // nx * ny cells of size dx * dy. Vertically each layer is split into ncells
 // planes, so planes in different layers can have very different thicknesses.
 //
-// Each cell exchanges heat with its 6 neighbors through a thermal conductance
-// G (W/K). Between planes l and l+1 the two half-cells are in series:
-//     G = A / ( dz_l / (2 k_l) + dz_{l+1} / (2 k_{l+1}) )
-// which is the harmonic-mean rule for k at a material interface. The top plane
+// Materials are stored per cell, so a layer can contain TSV regions. Each cell
+// exchanges heat with its 6 neighbors through a face conductance G (W/K): the
+// two half-cells on either side of a face are in series,
+//     G = area / ( d1 / (2 k1) + d2 / (2 k2) )
+// which is the harmonic-mean rule for k at a material change. The top plane
 // connects to ambient through half a cell plus the heat sink (1 / h_top), the
-// bottom plane through half a cell plus 1 / h_bot (h_bot = 0 means adiabatic).
-// The side walls are adiabatic.
+// bottom plane through half a cell plus 1 / h_bot (h_bot = 0: adiabatic). The
+// side walls are adiabatic.
 //
 // Temperatures are solved relative to ambient: the energy balance of cell c is
-//     sum_n G_n (T_c - T_n) + G_amb T_c = P_c
-// which is a symmetric positive definite linear system A T = P.
+//     C_c dT_c/dt + sum_n G_n (T_c - T_n) + G_amb T_c = P_c
+// Steady state drops the first term; a backward Euler step turns it into C/dt.
+//
+// TSVs (through-silicon vias) are copper columns too small to resolve, so a TSV
+// region is modeled as an effective medium with copper area fraction f:
+//     vertical:  k_z  = f k_Cu + (1 - f) k        (parallel paths)
+//     lateral:   k_xy = k ((1+f) k_Cu + (1-f) k) / ((1-f) k_Cu + (1+f) k)
+//                (Rayleigh / Maxwell-Garnett for parallel cylinders)
+//     rho*c:     f rho_c_Cu + (1 - f) rho_c
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
 
-constexpr int MAXZ = 64;  // max number of z-planes (GPU keeps them in constant memory)
+constexpr int MAXZ = 64;  // max number of z-planes
 
 struct Layer {
     std::string name;
@@ -38,20 +47,35 @@ struct Model3D {
     double Lx = 0, Ly = 0, dx = 0, dy = 0;  // m
     double h_top = 0, h_bot = 0;            // W/(m^2 K)
     double T_amb = 25.0;                    // deg C
+    double tsv_k = 400.0, tsv_rho_c = 3.45e6;  // TSV fill (copper)
     std::vector<Layer> layers;
 
-    // Per z-plane data.
+    // Per z-plane.
     std::vector<int> plane_layer;  // which layer each plane belongs to
-    std::vector<double> dz, k;
-    std::vector<double> gx, gy;    // lateral conductance between neighbor cells (W/K)
-    std::vector<double> gzd, gzu;  // conductance to plane below / above (or ambient)
-    std::vector<double> cap;       // heat capacity of one cell (J/K)
+    std::vector<double> dz;
 
-    std::vector<double> P;         // power per cell (W), nx * ny * nz
+    // Per cell (nx * ny * nz, x fastest, then y, then z).
+    std::vector<double> tsv_frac;  // copper area fraction, 0 outside TSV regions
+    std::vector<double> P;         // power (W)
+
+    // Operator, built by finalize() from the above. Stored in float: they define
+    // the discrete model (a 1e-7 relative perturbation of it), they don't carry
+    // the solution, and float halves their memory traffic.
+    std::vector<float> gE;   // conductance to the +x neighbor (0 on the last column)
+    std::vector<float> gN;   // conductance to the +y neighbor (0 on the last row)
+    std::vector<float> gU;   // to the +z neighbor; on the top plane: to ambient
+    std::vector<float> gB;   // nx * ny: bottom plane to ambient
+    std::vector<float> cap;  // heat capacity (J/K)
+    bool finalized = false;
 
     size_t nxy() const { return (size_t)nx * ny; }
     size_t ncells() const { return nxy() * nz; }
     size_t idx(int i, int j, int l) const { return ((size_t)l * ny + j) * nx + i; }
+    int layer_index(const std::string& name) const {
+        for (size_t L = 0; L < layers.size(); ++L)
+            if (layers[L].name == name) return (int)L;
+        return -1;
+    }
 };
 
 inline Model3D build_model(const std::vector<Layer>& layers, int nx, int ny,
@@ -62,37 +86,65 @@ inline Model3D build_model(const std::vector<Layer>& layers, int nx, int ny,
     m.Lx = Lx; m.Ly = Ly;
     m.dx = Lx / nx; m.dy = Ly / ny;
     m.h_top = h_top; m.h_bot = h_bot;
-
     for (size_t L = 0; L < layers.size(); ++L)
         for (int c = 0; c < layers[L].ncells; ++c) {
             m.plane_layer.push_back((int)L);
             m.dz.push_back(layers[L].thickness / layers[L].ncells);
-            m.k.push_back(layers[L].k);
         }
     m.nz = (int)m.dz.size();
     if (m.nz > MAXZ) {
         fprintf(stderr, "Too many z-planes (%d > %d)\n", m.nz, MAXZ);
         exit(1);
     }
-
-    const double A = m.dx * m.dy;
-    m.gx.resize(m.nz); m.gy.resize(m.nz);
-    m.gzd.resize(m.nz); m.gzu.resize(m.nz); m.cap.resize(m.nz);
-    for (int l = 0; l < m.nz; ++l) {
-        m.cap[l] = layers[m.plane_layer[l]].rho_c * A * m.dz[l];
-        m.gx[l] = m.k[l] * m.dy * m.dz[l] / m.dx;
-        m.gy[l] = m.k[l] * m.dx * m.dz[l] / m.dy;
-        double half = m.dz[l] / (2.0 * m.k[l]);
-        double R_up = (l < m.nz - 1) ? half + m.dz[l + 1] / (2.0 * m.k[l + 1])
-                                     : half + 1.0 / h_top;
-        m.gzu[l] = A / R_up;
-    }
-    for (int l = 0; l < m.nz; ++l) {
-        if (l > 0) m.gzd[l] = m.gzu[l - 1];
-        else m.gzd[l] = (h_bot > 0) ? A / (m.dz[0] / (2.0 * m.k[0]) + 1.0 / h_bot) : 0.0;
-    }
+    m.tsv_frac.assign(m.ncells(), 0.0);
     m.P.assign(m.ncells(), 0.0);
     return m;
+}
+
+// Effective properties of a cell given its layer's k and TSV fraction f.
+inline double eff_kz(double k, double kc, double f) { return f * kc + (1 - f) * k; }
+inline double eff_kxy(double k, double kc, double f) {
+    return k * ((1 + f) * kc + (1 - f) * k) / ((1 - f) * kc + (1 + f) * k);
+}
+
+// Builds the face conductances and capacities. Call after all TSV regions are
+// added (power can change at any time; it doesn't enter the operator).
+inline void finalize(Model3D& m) {
+    const size_t n = m.ncells(), sxy = m.nxy();
+    const double A = m.dx * m.dy;
+    std::vector<double> kxy(n), kz(n);
+    m.cap.assign(n, 0.0f);
+    for (int l = 0; l < m.nz; ++l) {
+        const Layer& L = m.layers[m.plane_layer[l]];
+        for (size_t c = 0; c < sxy; ++c) {
+            size_t id = (size_t)l * sxy + c;
+            double f = m.tsv_frac[id];
+            kxy[id] = eff_kxy(L.k, m.tsv_k, f);
+            kz[id] = eff_kz(L.k, m.tsv_k, f);
+            m.cap[id] = (float)((f * m.tsv_rho_c + (1 - f) * L.rho_c) * A * m.dz[l]);
+        }
+    }
+    m.gE.assign(n, 0.0f);
+    m.gN.assign(n, 0.0f);
+    m.gU.assign(n, 0.0f);
+    m.gB.assign(sxy, 0.0f);
+    for (int l = 0; l < m.nz; ++l)
+        for (int j = 0; j < m.ny; ++j)
+            for (int i = 0; i < m.nx; ++i) {
+                size_t id = m.idx(i, j, l);
+                double dz = m.dz[l];
+                if (i < m.nx - 1)
+                    m.gE[id] = (float)(m.dy * dz / (m.dx / (2 * kxy[id]) + m.dx / (2 * kxy[id + 1])));
+                if (j < m.ny - 1)
+                    m.gN[id] = (float)(m.dx * dz / (m.dy / (2 * kxy[id]) + m.dy / (2 * kxy[id + m.nx])));
+                double R_up = (l < m.nz - 1)
+                                  ? dz / (2 * kz[id]) + m.dz[l + 1] / (2 * kz[id + sxy])
+                                  : dz / (2 * kz[id]) + 1.0 / m.h_top;
+                m.gU[id] = (float)(A / R_up);
+                if (l == 0 && m.h_bot > 0)
+                    m.gB[id] = (float)(A / (dz / (2 * kz[id]) + 1.0 / m.h_bot));
+            }
+    m.finalized = true;
 }
 
 // A two-tier 3D IC on a 10 mm x 10 mm footprint, listed bottom to top.
@@ -109,21 +161,70 @@ inline std::vector<Layer> default_stack() {
     };
 }
 
+// Not finalized: add TSVs if needed, then call finalize().
 inline Model3D default_model(int nx, int ny) {
     // h_top = 2e4 W/m^2K on 1 cm^2 is a 0.5 K/W heat sink. Bottom is adiabatic.
     return build_model(default_stack(), nx, ny, 10e-3, 10e-3, 2e4, 0.0);
 }
 
-// Spreads `watts` evenly over every cell of active layer `layer`.
-inline void add_uniform_power(Model3D& m, int layer, double watts) {
-    int planes = m.layers[layer].ncells;
-    double w = watts / ((double)m.nxy() * planes);
-    for (int l = 0; l < m.nz; ++l)
-        if (m.plane_layer[l] == layer)
-            for (size_t c = 0; c < m.nxy(); ++c) m.P[(size_t)l * m.nxy() + c] += w;
+// Overlap length of intervals [a0, a1] and [b0, b1].
+inline double overlap(double a0, double a1, double b0, double b1) {
+    return std::max(0.0, std::min(a1, b1) - std::max(a0, b0));
 }
 
-// Adds `watts` in a square hotspot of side `size` (m) centered at (xc, yc).
+// Calls fn(cell index within a plane, covered fraction of that cell) for every
+// cell overlapping the rectangle [x0, x0 + w] x [y0, y0 + h] (m).
+template <class Fn>
+void for_each_overlap(const Model3D& m, double x0, double y0, double w, double h, Fn fn) {
+    int i0 = std::max(0, (int)std::floor(x0 / m.dx));
+    int i1 = std::min(m.nx - 1, (int)std::ceil((x0 + w) / m.dx));
+    int j0 = std::max(0, (int)std::floor(y0 / m.dy));
+    int j1 = std::min(m.ny - 1, (int)std::ceil((y0 + h) / m.dy));
+    for (int j = j0; j <= j1; ++j)
+        for (int i = i0; i <= i1; ++i) {
+            double a = overlap(i * m.dx, (i + 1) * m.dx, x0, x0 + w) *
+                       overlap(j * m.dy, (j + 1) * m.dy, y0, y0 + h);
+            if (a > 0) fn((size_t)j * m.nx + i, a / (m.dx * m.dy));
+        }
+}
+
+// Power block: `watts` spread uniformly over the rectangle in active layer
+// `layer` (all planes of that layer), area-weighted so partially covered cells
+// get their share. Total power is conserved exactly when the block is on the die.
+inline void add_power_block(Model3D& m, int layer, double x0, double y0, double w, double h,
+                            double watts) {
+    const double density = watts / (w * h);  // W per m^2 of footprint
+    const int planes = m.layers[layer].ncells;
+    for (int l = 0; l < m.nz; ++l) {
+        if (m.plane_layer[l] != layer) continue;
+        for_each_overlap(m, x0, y0, w, h, [&](size_t c, double frac) {
+            m.P[(size_t)l * m.nxy() + c] += density * frac * m.dx * m.dy / planes;
+        });
+    }
+}
+
+// TSV region with copper area fraction f in layer `layer`. Partially covered
+// cells get a proportionally smaller fraction. Call finalize() afterwards.
+inline void add_tsv_region(Model3D& m, int layer, double x0, double y0, double w, double h,
+                           double f) {
+    for (int l = 0; l < m.nz; ++l) {
+        if (m.plane_layer[l] != layer) continue;
+        for_each_overlap(m, x0, y0, w, h, [&](size_t c, double frac) {
+            double& t = m.tsv_frac[(size_t)l * m.nxy() + c];
+            t = std::min(1.0, t + f * frac);
+        });
+    }
+    m.finalized = false;
+}
+
+// Spreads `watts` evenly over every cell of active layer `layer`.
+inline void add_uniform_power(Model3D& m, int layer, double watts) {
+    add_power_block(m, layer, 0, 0, m.Lx, m.Ly, watts);
+}
+
+// Adds `watts` in a square hotspot of side `size` (m) centered at (xc, yc),
+// over the cells whose centers fall inside it (kept from earlier milestones so
+// results stay comparable).
 inline void add_hotspot(Model3D& m, int layer, double xc, double yc, double size,
                         double watts) {
     std::vector<size_t> cells;
@@ -151,9 +252,10 @@ inline double total_power(const Model3D& m) {
 template <class Vec>
 double heat_out(const Model3D& m, const Vec& T) {
     double q = 0;
+    const size_t top = (size_t)(m.nz - 1) * m.nxy();
     for (size_t c = 0; c < m.nxy(); ++c) {
-        q += m.gzu[m.nz - 1] * (double)T[(size_t)(m.nz - 1) * m.nxy() + c];
-        q += m.gzd[0] * (double)T[c];
+        q += (double)m.gU[top + c] * (double)T[top + c];
+        q += (double)m.gB[c] * (double)T[c];
     }
     return q;
 }
@@ -163,29 +265,32 @@ double heat_out(const Model3D& m, const Vec& T) {
 template <class Vec>
 double heat_stored(const Model3D& m, const Vec& T_old, const Vec& T_new, double dt) {
     double q = 0;
-    for (int l = 0; l < m.nz; ++l) {
-        double s = 0;
-        for (size_t c = 0; c < m.nxy(); ++c) {
-            size_t id = (size_t)l * m.nxy() + c;
-            s += (double)T_new[id] - (double)T_old[id];
-        }
-        q += m.cap[l] * s / dt;
-    }
-    return q;
+    for (size_t c = 0; c < m.ncells(); ++c)
+        q += (double)m.cap[c] * ((double)T_new[c] - (double)T_old[c]);
+    return q / dt;
 }
 
-// Exact solution of the discrete model when power is uniform in x and y and the
-// bottom is adiabatic: no lateral flow, so every column is a 1D resistor chain.
-// Returns the temperature rise of each plane.
+// Exact solution when power is uniform in x and y, the bottom is adiabatic and
+// there are no TSVs: no lateral flow, so every column is a 1D resistor chain.
+// Returns the temperature rise of each plane. Computed in double from the layer
+// data, independently of the (float) operator.
 inline std::vector<double> analytic_1d(const Model3D& m) {
-    std::vector<double> flux(m.nz), T(m.nz);
+    std::vector<double> flux(m.nz), T(m.nz), gz(m.nz);
+    const double A = m.dx * m.dy;
+    for (int l = 0; l < m.nz; ++l) {
+        double k = m.layers[m.plane_layer[l]].k;
+        double R = (l < m.nz - 1)
+                       ? m.dz[l] / (2 * k) + m.dz[l + 1] / (2 * m.layers[m.plane_layer[l + 1]].k)
+                       : m.dz[l] / (2 * k) + 1.0 / m.h_top;
+        gz[l] = A / R;
+    }
     double F = 0;
     for (int l = 0; l < m.nz; ++l) {
         for (size_t c = 0; c < m.nxy(); ++c) F += m.P[(size_t)l * m.nxy() + c];
         flux[l] = F;  // heat crossing the top face of plane l
     }
     const double nxy = (double)m.nxy();
-    T[m.nz - 1] = flux[m.nz - 1] / (m.gzu[m.nz - 1] * nxy);
-    for (int l = m.nz - 2; l >= 0; --l) T[l] = T[l + 1] + flux[l] / (m.gzu[l] * nxy);
+    T[m.nz - 1] = flux[m.nz - 1] / (gz[m.nz - 1] * nxy);
+    for (int l = m.nz - 2; l >= 0; --l) T[l] = T[l + 1] + flux[l] / (gz[l] * nxy);
     return T;
 }

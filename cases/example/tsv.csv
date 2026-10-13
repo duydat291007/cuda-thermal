@@ -1,0 +1,6 @@
+# TSV fields between the cores, through the bond layer and the top die. cu_fraction = copper area fraction.
+layer, x_mm, y_mm, w_mm, h_mm, cu_fraction
+bond + BEOL, 2.55, 0.5, 0.40, 4.5, 0.15
+bond + BEOL, 0.5, 2.55, 4.5, 0.40, 0.15
+Si tier 1 (top), 2.55, 0.5, 0.40, 4.5, 0.15
+Si tier 1 (top), 0.5, 2.55, 4.5, 0.40, 0.15

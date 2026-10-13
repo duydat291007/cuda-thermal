@@ -7,12 +7,18 @@
 //                              heat-up after power-on, n x n grid (default 200),
 //                              multigrid unless "jacobi" is given;
 //                              prints a timeline and writes transient.csv
+//   thermal3d case <folder> [n]
+//                              steady state of a case (stack.csv, floorplan.csv,
+//                              tsv.csv) on an n x n grid (default 200): block
+//                              temperatures, TSV effect, tmap_*.csv heat maps
 // Compiled with -DREAL_FLOAT the solver runs in float, to show why it shouldn't.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include "case3d.h"
 #include "pcg3d.h"
 #include "stack3d.h"
 #include "transient3d.h"
@@ -46,6 +52,15 @@ static Model3D hotspot_model(int n) {
     add_uniform_power(m, 0, 22.0);
     add_hotspot(m, 0, 3e-3, 3e-3, 1e-3, 3.0);
     add_uniform_power(m, 2, 25.0);
+    finalize(m);
+    return m;
+}
+
+// Tiny model for warming up the GPU (the first CUDA call pays context setup).
+static Model3D warmup_model() {
+    Model3D m = default_model(32, 32);
+    add_uniform_power(m, 0, 1.0);
+    finalize(m);
     return m;
 }
 
@@ -77,6 +92,7 @@ static bool verify() {
         Model3D m = default_model(n, n);
         add_uniform_power(m, 0, 25.0);
         add_uniform_power(m, 2, 25.0);
+        finalize(m);
         SolveResult c = cpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
         SolveResult g = gpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
         std::vector<double> Tz = analytic_1d(m);
@@ -183,7 +199,160 @@ static bool verify() {
         ok &= check("transient multigrid vs Jacobi / Tmax", max_abs_diff(tm.T, tj.T) / max_of(tj.T),
                     kMatchTol);
     }
+
+    // Test 5: per-cell materials. Power blocks from a floorplan, and TSVs.
+    {
+        printf("\n== verify 5: floorplan and TSVs, %d x %d ==\n", n, n);
+        const CaseSpec cs = example_case();
+
+        // Power blocks are spread area-weighted over partially covered cells, so the
+        // total must be conserved exactly even when edges fall inside cells.
+        Model3D mb = default_model(n, n);
+        double want = 0;
+        for (const PowerBlock& b : cs.blocks) {  // shift off the cell edges where it fits
+            double sx = (b.x0 + b.w + 0.037e-3 <= mb.Lx) ? 0.037e-3 : 0.0;
+            double sy = (b.y0 + b.h + 0.011e-3 <= mb.Ly) ? 0.011e-3 : 0.0;
+            add_power_block(mb, b.layer, b.x0 + sx, b.y0 + sy, b.w, b.h, b.watts);
+            want += b.watts;
+        }
+        ok &= check("floorplan power conserved, rel. err", std::fabs(total_power(mb) - want) / want,
+                    1e-12);
+
+        // TSVs over the whole bond layer act like a bond layer with k = k_z(eff):
+        // with uniform power that has the exact 1D solution.
+        const int bond = find_layer(cs.layers, "bond + BEOL");
+        const double f = 0.2;
+        Model3D mt = default_model(n, n);
+        add_uniform_power(mt, 0, 25.0);
+        add_uniform_power(mt, 2, 25.0);
+        add_tsv_region(mt, bond, 0, 0, mt.Lx, mt.Ly, f);
+        finalize(mt);
+        std::vector<Layer> eq_layers = default_stack();
+        eq_layers[bond].k = eff_kz(eq_layers[bond].k, mt.tsv_k, f);
+        Model3D ma = build_model(eq_layers, n, n, mt.Lx, mt.Ly, mt.h_top, mt.h_bot);
+        add_uniform_power(ma, 0, 25.0);
+        add_uniform_power(ma, 2, 25.0);
+        std::vector<double> Tz = analytic_1d(ma);
+        SolveResult gt = gpu_pcg(mt, 1e-10, kMaxIt, Precond::Multigrid);
+        double e = 0, tmax = *std::max_element(Tz.begin(), Tz.end());
+        for (int l = 0; l < mt.nz; ++l)
+            for (size_t k = 0; k < mt.nxy(); ++k)
+                e = std::max(e, std::fabs(gt.T[(size_t)l * mt.nxy() + k] - Tz[l]));
+        ok &= gt.converged;
+        ok &= check("TSV layer vs exact 1D, err / Tmax", e / tmax, 1e-5);
+
+        // The example case: blocks plus TSV fields beside the cores.
+        Model3D m = build_case_model(cs, n, n, true);
+        const double P = total_power(m);
+        SolveResult c = cpu_pcg(m, 1e-9, kMaxIt, Precond::Multigrid);
+        SolveResult g = gpu_pcg(m, 1e-9, kMaxIt, Precond::Multigrid);
+        SolveResult gj = gpu_pcg(m, 1e-9, kMaxIt, Precond::Jacobi);
+        printf("  example case, iterations to 1e-9: multigrid CPU %d, GPU %d; Jacobi GPU %d\n",
+               c.iters, g.iters, gj.iters);
+        ok &= c.converged && g.converged && gj.converged;
+        ok &= check("GPU true residual", true_relres(m, g.T), kTrueTol);
+        ok &= check("max |GPU - CPU| / Tmax", max_abs_diff(g.T, c.T) / max_of(c.T), kMatchTol);
+        ok &= check("max |multigrid - Jacobi| / Tmax", max_abs_diff(g.T, gj.T) / max_of(gj.T),
+                    kMatchTol);
+        ok &= check("energy balance |out - in| / in", std::fabs(heat_out(m, g.T) - P) / P, 1e-6);
+    }
     return ok;
+}
+
+// Max and area-weighted mean temperature rise of a power block, over its
+// layer's planes.
+static void block_temps(const Model3D& m, const std::vector<Real>& T, const PowerBlock& b,
+                        double& tmax, double& tavg) {
+    tmax = -1e30;
+    double sum = 0, wsum = 0;
+    for (int l = 0; l < m.nz; ++l) {
+        if (m.plane_layer[l] != b.layer) continue;
+        for_each_overlap(m, b.x0, b.y0, b.w, b.h, [&](size_t c, double frac) {
+            double t = T[(size_t)l * m.nxy() + c];
+            tmax = std::max(tmax, t);
+            sum += frac * t;
+            wsum += frac;
+        });
+    }
+    tavg = sum / wsum;
+}
+
+// Writes the hottest temperature through each active layer's planes as a grid
+// (row = y, column = x, deg C) for a heat map in Excel or matplotlib.
+static void write_tmaps(const Model3D& m, const std::vector<Real>& T) {
+    for (size_t L = 0; L < m.layers.size(); ++L) {
+        if (!m.layers[L].active) continue;
+        std::string name = "tmap_layer" + std::to_string(L) + ".csv";
+        FILE* f = fopen(name.c_str(), "w");
+        if (!f) { printf("  could not write %s\n", name.c_str()); continue; }
+        for (int j = m.ny - 1; j >= 0; --j) {  // top row = largest y, like a floorplan drawing
+            for (int i = 0; i < m.nx; ++i) {
+                double t = -1e30;
+                for (int l = 0; l < m.nz; ++l)
+                    if (m.plane_layer[l] == (int)L) t = std::max(t, (double)T[m.idx(i, j, l)]);
+                fprintf(f, i ? ",%.3f" : "%.3f", t + m.T_amb);
+            }
+            fprintf(f, "\n");
+        }
+        fclose(f);
+        printf("  wrote %s  (%s, %d x %d, deg C)\n", name.c_str(), m.layers[L].name.c_str(),
+               m.nx, m.ny);
+    }
+}
+
+static int run_case(const std::string& dir, int n) {
+    CaseSpec cs;
+    std::string err;
+    if (!load_case(dir, cs, err)) {
+        printf("Could not load case '%s': %s\n", dir.c_str(), err.c_str());
+        return 1;
+    }
+    Model3D m = build_case_model(cs, n, n, true);
+    const double P = total_power(m);
+    printf("\n== case %s: %d layers, %zu power blocks, %zu TSV regions, %.1f W, %d x %d x %d cells ==\n",
+           dir.c_str(), (int)cs.layers.size(), cs.blocks.size(), cs.tsvs.size(), P, n, n, m.nz);
+
+    gpu_pcg(warmup_model(), kTol, 10, Precond::Jacobi);
+    SolveResult g = gpu_pcg(m, 1e-8, kMaxIt, Precond::Multigrid);
+    printf("  solved in %d multigrid PCG iterations, %.0f ms; true residual %.1e, energy balance %.1e\n",
+           g.iters, g.ms, true_relres(m, g.T), std::fabs(heat_out(m, g.T) - P) / P);
+    if (!g.converged) printf("  WARNING: did not converge\n");
+
+    std::vector<Real> T0;  // the same case without TSVs, to show their effect
+    if (!cs.tsvs.empty()) {
+        Model3D m0 = build_case_model(cs, n, n, false);
+        T0 = gpu_pcg(m0, 1e-8, kMaxIt, Precond::Multigrid).T;
+    }
+
+    printf("\n");
+    print_layers(m, g.T);
+
+    printf("\n  %-14s %-20s %7s %9s %9s %9s", "block", "layer", "W", "W/cm^2", "max(C)", "avg(C)");
+    if (!T0.empty()) printf(" %13s", "TSVs change");
+    printf("\n");
+    for (const PowerBlock& b : cs.blocks) {
+        double tmax, tavg;
+        block_temps(m, g.T, b, tmax, tavg);
+        printf("  %-14s %-20s %7.2f %9.1f %9.2f %9.2f", b.name.c_str(),
+               cs.layers[b.layer].name.c_str(), b.watts, b.watts / (b.w * b.h * 1e4),
+               tmax + m.T_amb, tavg + m.T_amb);
+        if (!T0.empty()) {
+            double t0max, t0avg;
+            block_temps(m, T0, b, t0max, t0avg);
+            printf(" %+10.2f C", tmax - t0max);
+        }
+        printf("\n");
+    }
+
+    size_t hot = (size_t)(std::max_element(g.T.begin(), g.T.end()) - g.T.begin());
+    int l = (int)(hot / m.nxy()), j = (int)((hot % m.nxy()) / m.nx), i = (int)(hot % m.nx);
+    printf("\n  hottest point: %.2f C in %s at x = %.2f mm, y = %.2f mm\n", g.T[hot] + m.T_amb,
+           m.layers[m.plane_layer[l]].name.c_str(), (i + 0.5) * m.dx * 1e3, (j + 0.5) * m.dy * 1e3);
+    if (!T0.empty())
+        printf("  without TSVs:  %.2f C\n", max_of(T0) + m.T_amb);
+    printf("\n");
+    write_tmaps(m, g.T);
+    return 0;
 }
 
 // Time at which T_max first reaches `frac` of its steady value, interpolated
@@ -205,7 +374,7 @@ static void transient_demo(int n, Precond pc) {
     printf("\n== transient: power switched on at t = 0, %d x %d x %d = %zu cells, %.0f W, %s, %s ==\n",
            n, n, m.nz, m.ncells(), P, sizeof(Real) == 8 ? "double" : "float", precond_name(pc));
 
-    gpu_pcg(default_model(32, 32), kTol, 10, Precond::Jacobi);  // warm-up: CUDA context setup
+    gpu_pcg(warmup_model(), kTol, 10, Precond::Jacobi);  // warm-up: CUDA context setup
 
     SolveResult ss = gpu_pcg(m, 1e-8, kMaxIt, Precond::Multigrid);
     const double Tss = max_of(ss.T);
@@ -260,7 +429,7 @@ static void benchmark(int n) {
            n, n, m.nz, m.ncells(), total_power(m), m.T_amb,
            sizeof(Real) == 8 ? "double" : "float");
 
-    gpu_pcg(default_model(32, 32), kTol, 10, Precond::Jacobi);  // warm-up: CUDA context setup
+    gpu_pcg(warmup_model(), kTol, 10, Precond::Jacobi);  // warm-up: CUDA context setup
 
     SolveResult gm = gpu_pcg(m, kTol, kMaxIt, Precond::Multigrid);
     SolveResult gj = gpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
@@ -297,6 +466,9 @@ static void benchmark(int n) {
 }
 
 int main(int argc, char** argv) {
+    if (argc >= 3 && strcmp(argv[1], "case") == 0) {
+        return run_case(argv[2], argc >= 4 ? atoi(argv[3]) : 200);
+    }
     if (argc >= 2 && strcmp(argv[1], "transient") == 0) {
         int n = argc >= 3 ? atoi(argv[2]) : 200;
         bool jacobi = argc >= 4 && strcmp(argv[3], "jacobi") == 0;

@@ -1,0 +1,4 @@
+# Same copper fraction as cases/example, but directly under core0 ("thermal TSVs").
+layer, x_mm, y_mm, w_mm, h_mm, cu_fraction
+bond + BEOL, 0.5, 0.5, 2.0, 2.0, 0.15
+Si tier 1 (top), 0.5, 0.5, 2.0, 2.0, 0.15

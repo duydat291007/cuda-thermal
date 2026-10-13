@@ -12,6 +12,7 @@
 // Build with -DREAL_FLOAT to reproduce that.
 #pragma once
 #include <vector>
+#include "operator3d.h"
 #include "stack3d.h"
 
 #ifdef REAL_FLOAT
@@ -57,19 +58,20 @@ inline const char* precond_name(Precond p) {
 }
 
 // Both solver classes have the same interface, so the transient driver
-// (transient3d.h) works with either one.
+// (transient3d.h) works with either one. The model must be finalized and must
+// outlive the solver.
 //
-//   set_shift(s)    per-plane diagonal shift S (size nz); zeros for steady state
+//   set_dt(dt)      time step for backward Euler; 0 = steady state
 //   set_x_zero()    x = 0
 //   set_rhs_steady()     b = P
-//   set_rhs_transient()  b = P + S x   (x holds the previous temperature)
-//   solve(tol, maxit)    PCG on (A + S) x = b, starting from the current x
+//   set_rhs_transient()  b = P + C/dt x   (x holds the previous temperature)
+//   solve(tol, maxit)    PCG on (A + C/dt) x = b, starting from the current x
 //   get_x(T)        copy x to the host
 
 class CpuPcg {
 public:
     CpuPcg(const Model3D& m, Precond pc);
-    void set_shift(const std::vector<double>& shift);
+    void set_dt(double dt);
     void set_x_zero();
     void set_rhs_steady();
     void set_rhs_transient();
@@ -81,18 +83,19 @@ private:
     void vcycle(size_t level);           // multigrid: solves level's b into its x
 
     struct Level {
-        int nx, ny;
-        std::vector<MgReal> dx, dy, icx, icy;  // geometry
-        std::vector<MgReal> fcp, finv;         // column factors (depend on the shift)
+        int nx, ny, nz;
+        std::vector<float> gE, gN, gU, gB, cap;  // operator
+        std::vector<MgReal> fcp, finv;           // column factors (depend on dt)
         std::vector<MgReal> x, b;
+        CellOp<float> op() const { return {nx, ny, nz, gE.data(), gN.data(), gU.data(), gB.data(), cap.data()}; }
     };
 
     const Model3D& m_;
     Precond pc_;
-    std::vector<Real> gx_, gy_, gzd_, gzu_, shift_;
+    Real inv_dt_ = 0;
+    CellOp<float> op_;                   // fine-grid operator (the model's arrays)
     std::vector<Real> P_, x_, b_, r_, z_, p_, Ap_, invd_;
     std::vector<Level> levels_;          // multigrid levels, finest first
-    std::vector<MgReal> kdz_, gzu_a_, gzd_a_, shift_a_;
 };
 
 class GpuPcg {
@@ -101,7 +104,7 @@ public:
     ~GpuPcg();
     GpuPcg(const GpuPcg&) = delete;
     GpuPcg& operator=(const GpuPcg&) = delete;
-    void set_shift(const std::vector<double>& shift);
+    void set_dt(double dt);
     void set_x_zero();
     void set_rhs_steady();
     void set_rhs_transient();
@@ -112,19 +115,20 @@ private:
     void vcycle(size_t level);           // multigrid only; level 0 b must hold r
 
     struct Level {
-        int nx, ny;
-        MgReal *dx = nullptr, *dy = nullptr, *icx = nullptr, *icy = nullptr;  // geometry
-        MgReal *fcp = nullptr, *finv = nullptr;  // column factors (depend on the shift)
+        int nx, ny, nz;
+        float *gE = nullptr, *gN = nullptr, *gU = nullptr, *gB = nullptr, *cap = nullptr;
+        MgReal *fcp = nullptr, *finv = nullptr;  // column factors (depend on dt)
         MgReal *x = nullptr, *b = nullptr;
+        CellOp<float> op() const { return {nx, ny, nz, gE, gN, gU, gB, cap}; }
     };
 
-    const Model3D& m_;
     Precond pc_;
     size_t n_;
+    Real inv_dt_ = 0;
     Real *P_ = nullptr, *x_ = nullptr, *b_ = nullptr, *r_ = nullptr, *z_ = nullptr,
          *p_ = nullptr, *Ap_ = nullptr, *invd_ = nullptr;
     double* dots_ = nullptr;
-    std::vector<Level> levels_;
+    std::vector<Level> levels_;          // level 0 holds the fine operator in both modes
 };
 
 // Steady-state solve from T = 0, with timing (GPU time includes allocation and
