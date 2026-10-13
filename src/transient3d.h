@@ -39,6 +39,7 @@ struct TransientResult {
     std::vector<Real> T;   // temperature rise at t_end
     long total_iters = 0;
     double ms = 0;         // wall time, including copying T to the host every step
+    double solve_ms = 0;   // time in set_dt, set_rhs_transient and solve only
     bool converged = true; // every step's PCG converged
 };
 
@@ -56,12 +57,15 @@ TransientResult run_transient(const Model3D& m, const TransientOptions& o) {
 
     while (t < o.t_end * (1 - 1e-12)) {
         dt = std::min(dt, o.t_end - t);
+        auto ts = std::chrono::high_resolution_clock::now();
         if (dt != last_dt) {  // C/dt changes, so the matrix and preconditioner change
             s.set_dt(dt);
             last_dt = dt;
         }
         s.set_rhs_transient();              // b = P + C/dt * T_old (x still holds T_old)
-        PcgStats st = s.solve(o.tol, o.maxit);
+        PcgStats st = s.solve(o.tol, o.maxit);  // returns after the GPU finished
+        res.solve_ms += std::chrono::duration<double, std::milli>(
+                            std::chrono::high_resolution_clock::now() - ts).count();
         s.get_x(T_new);
         t += dt;
 

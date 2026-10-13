@@ -205,6 +205,18 @@ static bool verify() {
         ok &= check("transient energy balance, worst step", eb, 1e-6);
         ok &= check("transient multigrid vs Jacobi / Tmax", max_abs_diff(tm.T, tj.T) / max_of(tj.T),
                     kMatchTol);
+
+        // CUDA graphs replay the same kernels, so the transient (where 1/dt changes
+        // between graph replays) must match launching them directly, step by step.
+        gpu_use_graphs(false);
+        o.precond = Precond::Multigrid;
+        TransientResult tn = run_transient<GpuPcg>(m, o);
+        gpu_use_graphs(true);
+        printf("  transient PCG iterations: graphs %ld, direct launches %ld\n", tm.total_iters,
+               tn.total_iters);
+        ok &= tn.converged;
+        ok &= check("transient graphs vs direct launches / Tmax",
+                    max_abs_diff(tm.T, tn.T) / max_of(tn.T), kMatchTol);
     }
 
     // Test 5: per-cell materials. Power blocks from a floorplan, and TSVs.
@@ -321,8 +333,8 @@ static int run_case(const std::string& dir, int n) {
 
     gpu_pcg(warmup_model(), kTol, 10, Precond::Jacobi);
     SolveResult g = gpu_pcg(m, 1e-8, kMaxIt, Precond::Multigrid);
-    printf("  solved in %d multigrid PCG iterations, %.0f ms; true residual %.1e, energy balance %.1e\n",
-           g.iters, g.ms, true_relres(m, g.T), std::fabs(heat_out(m, g.T) - P) / P);
+    printf("  solved in %d multigrid PCG iterations, %.1f ms (+ %.0f ms setup); true residual %.1e, energy balance %.1e\n",
+           g.iters, g.solve_ms, g.setup_ms, true_relres(m, g.T), std::fabs(heat_out(m, g.T) - P) / P);
     if (!g.converged) printf("  WARNING: did not converge\n");
 
     std::vector<Real> T0;  // the same case without TSVs, to show their effect
@@ -413,7 +425,8 @@ static int compare_case_3dice(const std::string& dir, double cell_um, const std:
     SolveResult g = gpu_pcg(m, 1e-10, kMaxIt, Precond::Multigrid);
     printf("\n== compare with 3D-ICE: %s, %d x %d x %d cells, %.1f W ==\n", dir.c_str(), nx, ny,
            m.nz, total_power(m));
-    printf("  ours: %d multigrid iterations, %.0f ms, true residual %.1e\n", g.iters, g.ms,
+    printf("  ours: %d multigrid iterations, %.1f ms (+ %.0f ms setup), true residual %.1e\n",
+           g.iters, g.solve_ms, g.setup_ms,
            true_relres(m, g.T));
 
     int failures = 0;
@@ -520,8 +533,10 @@ static void transient_demo(int n, Precond pc) {
 
     double eb = 0;
     for (const StepRecord& r : tr.steps) eb = std::max(eb, std::fabs(r.q_out + r.q_stored - P) / P);
-    printf("\n  %zu steps, %ld PCG iterations, %.0f ms total (%.3f ms / iteration)\n",
-           tr.steps.size(), tr.total_iters, tr.ms, tr.ms / (double)tr.total_iters);
+    printf("\n  %zu steps, %ld PCG iterations, %.0f ms total, of which %.0f ms solving\n"
+           "  (%.3f ms / iteration; the rest is setup and copying T to the host every step)\n",
+           tr.steps.size(), tr.total_iters, tr.ms, tr.solve_ms,
+           tr.solve_ms / (double)tr.total_iters);
     printf("  worst energy balance |out + stored - in| / in = %.2e\n", eb);
     if (!tr.converged) printf("  WARNING: some steps hit the iteration limit\n");
 
@@ -549,28 +564,35 @@ static void benchmark(int n) {
 
     SolveResult gm = gpu_pcg(m, kTol, kMaxIt, Precond::Multigrid);
     SolveResult gj = gpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
+    gpu_use_graphs(false);  // same kernels, launched one by one
+    SolveResult gmn = gpu_pcg(m, kTol, kMaxIt, Precond::Multigrid);
+    gpu_use_graphs(true);
     print_layers(m, gm.T);
 
-    printf("\n  %-16s %8s %12s %12s\n", "", "iters", "time (ms)", "ms / iter");
+    printf("\n  %-26s %6s %10s %10s %10s %10s\n", "", "iters", "setup ms", "solve ms",
+           "ms / iter", "speedup");
     auto row = [](const char* name, const SolveResult& r, double ref_ms) {
-        printf("  %-16s %8d %12.1f %12.3f", name, r.iters, r.ms, r.ms / r.iters);
-        if (ref_ms > 0) printf("   %7.1fx", ref_ms / r.ms);
-        printf("\n");
+        printf("  %-26s %6d %10.1f %10.2f %10.3f %9.1fx\n", name, r.iters, r.setup_ms,
+               r.solve_ms, r.solve_ms / r.iters, ref_ms / r.solve_ms);
     };
     double ref = 0;
     if (n <= 256) {  // the CPU is too slow beyond this
         SolveResult cj = cpu_pcg(m, kTol, kMaxIt, Precond::Jacobi);
         SolveResult cm = cpu_pcg(m, kTol, kMaxIt, Precond::Multigrid);
-        ref = cj.ms;
-        printf("  (speedup is relative to CPU Jacobi)\n");
+        ref = cj.solve_ms;
+        printf("  (solve time only; speedup is relative to CPU Jacobi)\n");
         row("CPU Jacobi", cj, ref);
         row("CPU multigrid", cm, ref);
     } else {
-        ref = gj.ms;
-        printf("  (speedup is relative to GPU Jacobi)\n");
+        ref = gj.solve_ms;
+        printf("  (solve time only; speedup is relative to GPU Jacobi)\n");
     }
     row("GPU Jacobi", gj, ref);
+    row("GPU multigrid, no graphs", gmn, ref);
     row("GPU multigrid", gm, ref);
+    printf("  CUDA graphs: multigrid solve %.2f -> %.2f ms (%.2fx); setup is done once per solver\n",
+           gmn.solve_ms, gm.solve_ms, gmn.solve_ms / gm.solve_ms);
+    printf("  max |graphs - no graphs| / Tmax = %.3e\n", max_abs_diff(gm.T, gmn.T) / max_of(gm.T));
     printf("  max |multigrid - Jacobi| / Tmax = %.3e\n", max_abs_diff(gm.T, gj.T) / max_of(gj.T));
 
     // Always check the answer, not just the solver's own convergence flag.

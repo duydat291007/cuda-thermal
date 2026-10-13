@@ -98,6 +98,10 @@ private:
     std::vector<Level> levels_;          // multigrid levels, finest first
 };
 
+// CUDA handle types, declared here so CPU-only code can include this header.
+struct CUstream_st;
+struct CUgraphExec_st;
+
 class GpuPcg {
 public:
     GpuPcg(const Model3D& m, Precond pc);
@@ -113,6 +117,10 @@ public:
 
 private:
     void vcycle(size_t level);           // multigrid only; level 0 b must hold r
+    void iter_a();                       // enqueue part A of an iteration (see .cu)
+    void iter_b();                       // enqueue part B
+    void run_a();                        // part A: replay its graph, or launch directly
+    void run_b();
 
     struct Level {
         int nx, ny, nz;
@@ -127,17 +135,26 @@ private:
     Real inv_dt_ = 0;
     Real *P_ = nullptr, *x_ = nullptr, *b_ = nullptr, *r_ = nullptr, *z_ = nullptr,
          *p_ = nullptr, *Ap_ = nullptr, *invd_ = nullptr;
-    double* dots_ = nullptr;
+    double* sc_ = nullptr;               // device scalars: dot products, alpha, beta, 1/dt
+    double* h_sc_ = nullptr;             // pinned host copy
+    CUstream_st* s_ = nullptr;           // the solver's stream (cudaStream_t)
+    CUgraphExec_st* graph_a_ = nullptr;  // recorded iteration parts (cudaGraphExec_t)
+    CUgraphExec_st* graph_b_ = nullptr;
     std::vector<Level> levels_;          // level 0 holds the fine operator in both modes
 };
 
-// Steady-state solve from T = 0, with timing (GPU time includes allocation and
-// transfers).
+// GPU multigrid iterations are replayed from CUDA graphs by default. Pass false before
+// building a GpuPcg to launch every kernel directly instead (for comparison).
+void gpu_use_graphs(bool on);
+
+// Steady-state solve from T = 0, with timing.
 struct SolveResult {
     std::vector<Real> T;   // temperature rise above ambient, per cell (K)
     int iters = 0;
     double relres = 0;
-    double ms = 0;
+    double ms = 0;         // total: setup + solve + download + freeing
+    double setup_ms = 0;   // build multigrid levels, allocate, upload (GPU: record graphs)
+    double solve_ms = 0;   // the PCG solve alone
     bool converged = false;
 };
 SolveResult cpu_pcg(const Model3D& m, double tol, int maxit, Precond pc);

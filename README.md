@@ -61,7 +61,32 @@ runs at 1/64 speed on GeForce) and half its threads idled in red-black order. No
 the conductances and each column's tridiagonal factors are precomputed per level
 whenever the time step changes, the smoother only multiplies, and threads are
 launched only for the active color. Result: smoother 6.6 -> 1.4 ms per pass,
-800 x 800 steady solve 488 -> 236 ms.
+800 x 800 steady solve 488 -> 236 ms (these two include setup, see below).
+
+**Launch overhead: scalars on the GPU, CUDA graphs.** PCG used to read 3 dot
+products back to the CPU every iteration (each a blocking copy), and a multigrid
+iteration is ~80 kernel launches, most of them tiny ones on the coarse levels.
+Now alpha, beta, 1/dt and the dot products live in a small device array, one-thread
+kernels compute alpha and beta, and the CPU waits once per iteration, for
+||r||^2. Since no kernel argument changes between iterations any more, each half
+of a multigrid iteration is recorded once as a CUDA graph and replayed with a
+single launch. The benchmark now times setup (building levels, allocating,
+uploading, recording graphs) separately from the solve. RTX 4060 laptop, Windows:
+
+| grid | setup | solve, direct launches | solve, CUDA graphs | gain |
+|---|---|---|---|---|
+| 200 x 200 x 10 | 8.6 ms | 7.34 ms | 5.79 ms (8 iterations) | 1.27x |
+| 256 x 256 x 10 | 14.2 ms | 9.09 ms | 6.80 ms (8 iterations) | 1.34x |
+| 800 x 800 x 10 | 101 ms | 99.4 ms | 102.8 ms (9 iterations) | none |
+
+Graphs help where launch overhead is a large share of an iteration, and not at
+800 x 800, where the kernels themselves take ~11 ms per iteration. The table also
+shows that half of the earlier "236 ms" at 800 x 800 was setup; the solve is
+~100 ms. For the Jacobi preconditioner (4 kernels per iteration) graphs were no
+faster, so only multigrid uses them. Graph replay matches direct launches to
+1e-13 (verify 4 checks it through a transient, where 1/dt changes between replays).
+Transient, 200 x 200, 107 steps to 2 s: 842 PCG iterations, 522 ms of solving
+(0.62 ms per iteration).
 
 **Mixed precision:** PCG runs in double, the multigrid V-cycle in float. The
 V-cycle only proposes a search direction and PCG measures its effect in double,
@@ -125,8 +150,8 @@ source layer) and disjoint power blocks (3D-ICE requires them). Results:
 
 0.0005 C is the rounding of 3D-ICE's output (3 decimals), so the two agree to the
 last digit it prints. (3D-ICE timings on a 2-core cloud machine with its
-default single-threaded direct solver; ours solves the 200 x 200 case in ~30 ms on
-an RTX 4060.)
+default single-threaded direct solver. On the RTX 4060 laptop, 3D-ICE takes 2.8 s
+for the 100 x 100 case; ours takes 16 ms including setup.)
 
 **TSVs.** 3D-ICE 4.0 can give a layer a layout file of rectangles made of other
 (anisotropic) materials. The exporter writes one material per distinct TSV
@@ -188,7 +213,7 @@ cmake --build build --config Release
 | `src/pcg3d.h` | Solver interface: `CpuPcg` and `GpuPcg` objects, preconditioner choice |
 | `src/mg3d.h` | Multigrid: level geometry, column (line) smoother, coarse operators |
 | `src/pcg3d_cpu.cpp` | CPU reference PCG |
-| `src/pcg3d_gpu.cu` | GPU PCG and multigrid: stencil, smoother, transfer and reduction kernels |
+| `src/pcg3d_gpu.cu` | GPU PCG and multigrid: stencil, smoother, transfer and reduction kernels, device scalars, CUDA graphs |
 | `src/transient3d.h` | Backward Euler time stepping, works with either solver |
 | `src/main3d.cu` | 3D verification and benchmark driver |
 | `src/cuda_check.h` | `CUDA_CHECK` and `KERNEL_CHECK` macros |
@@ -201,8 +226,9 @@ cmake --build build --config Release
    ~90x more iterations than PCG on this stack, so the implicit solver moved up.
 4. ~~Transient: backward Euler time stepping with PCG~~
 5. ~~Multigrid preconditioner~~, ~~profiled and optimized~~, ~~float V-cycle in
-   double PCG~~. Next for speed: pinned host memory, keep PCG scalars on
-   the GPU, batch the small coarse-level launches (CUDA graphs)
+   double PCG~~, ~~PCG scalars on the GPU, CUDA graphs~~. Next for speed: the
+   kernels themselves at large grids (fewer or fused sweeps), and building the
+   multigrid levels on the GPU (setup equals the solve time at 800 x 800)
 6. ~~Power maps from files, TSVs (per-cell anisotropic materials)~~
 7. ~~Validate against 3D-ICE~~, ~~including TSV regions~~ (here): agreement to
    its output precision

@@ -189,7 +189,9 @@ SolveResult cpu_pcg(const Model3D& m, double tol, int maxit, Precond pc) {
     CpuPcg s(m, pc);
     s.set_x_zero();
     s.set_rhs_steady();
+    auto ta = std::chrono::high_resolution_clock::now();
     PcgStats st = s.solve(tol, maxit);
+    auto tb = std::chrono::high_resolution_clock::now();
     SolveResult res;
     s.get_x(res.T);
     res.iters = st.iters;
@@ -197,6 +199,8 @@ SolveResult cpu_pcg(const Model3D& m, double tol, int maxit, Precond pc) {
     res.converged = st.converged;
     auto t1 = std::chrono::high_resolution_clock::now();
     res.ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    res.setup_ms = std::chrono::duration<double, std::milli>(ta - t0).count();
+    res.solve_ms = std::chrono::duration<double, std::milli>(tb - ta).count();
     return res;
 }
 
