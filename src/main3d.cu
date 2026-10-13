@@ -11,12 +11,19 @@
 //                              steady state of a case (stack.csv, floorplan.csv,
 //                              tsv.csv) on an n x n grid (default 200): block
 //                              temperatures, TSV effect, tmap_*.csv heat maps
+//   thermal3d export3dice <folder> <cell_um> <outdir>
+//                              write the case as 3D-ICE input (case.stk, L*.flp)
+//   thermal3d compare3dice <folder> <cell_um> <dir>
+//                              solve the case on the same grid and compare with
+//                              the 3D-ICE results (tmap_L*.txt, tflp_*.txt) in dir
 // Compiled with -DREAL_FLOAT the solver runs in float, to show why it shouldn't.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include "case3d.h"
 #include "pcg3d.h"
@@ -355,6 +362,115 @@ static int run_case(const std::string& dir, int n) {
     return 0;
 }
 
+// Reads a 3D-ICE Tflp file: returns block name -> temperature (K).
+static bool read_3dice_tflp(const std::string& path, std::vector<std::string>& names,
+                            std::vector<double>& values) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("% Time", 0) == 0) {
+            std::stringstream ss(line.substr(1));
+            std::string tok;
+            ss >> tok;  // "Time(s)"
+            while (ss >> tok) {
+                size_t k = tok.find("(K)");
+                names.push_back(k == std::string::npos ? tok : tok.substr(0, k));
+            }
+        } else if (!line.empty() && line[0] != '%') {
+            std::stringstream ss(line);
+            double t, v;
+            ss >> t;  // time
+            while (ss >> v) values.push_back(v);
+        }
+    }
+    return !names.empty() && names.size() == values.size();
+}
+
+static int export_case_3dice(const std::string& dir, double cell_um, const std::string& outdir) {
+    CaseSpec cs;
+    std::string err;
+    if (!load_case(dir, cs, err) || !export_3dice(cs, cell_um, outdir, err)) {
+        printf("Export failed: %s\n", err.c_str());
+        return 1;
+    }
+    printf("Wrote %s/case.stk and floorplans (%g um cells, %d x %d).\n", outdir.c_str(), cell_um,
+           (int)std::lround(cs.Lx * 1e6 / cell_um), (int)std::lround(cs.Ly * 1e6 / cell_um));
+    printf("Run 3D-ICE there:  3D-ICE-Emulator case.stk\n");
+    return 0;
+}
+
+static int compare_case_3dice(const std::string& dir, double cell_um, const std::string& icedir) {
+    CaseSpec cs;
+    std::string err;
+    if (!load_case(dir, cs, err)) {
+        printf("Could not load case '%s': %s\n", dir.c_str(), err.c_str());
+        return 1;
+    }
+    const int nx = (int)std::lround(cs.Lx * 1e6 / cell_um), ny = (int)std::lround(cs.Ly * 1e6 / cell_um);
+    Model3D m = build_case_model(cs, nx, ny, true);
+    gpu_pcg(warmup_model(), kTol, 10, Precond::Jacobi);
+    SolveResult g = gpu_pcg(m, 1e-10, kMaxIt, Precond::Multigrid);
+    printf("\n== compare with 3D-ICE: %s, %d x %d x %d cells, %.1f W ==\n", dir.c_str(), nx, ny,
+           m.nz, total_power(m));
+    printf("  ours: %d multigrid iterations, %.0f ms, true residual %.1e\n", g.iters, g.ms,
+           true_relres(m, g.T));
+
+    int failures = 0;
+    for (size_t L = 0; L < cs.layers.size(); ++L) {
+        if (!cs.layers[L].active) continue;
+        int plane = -1;
+        for (int l = 0; l < m.nz; ++l)
+            if (m.plane_layer[l] == (int)L) plane = l;
+        std::vector<std::vector<double>> ice;
+        std::string path = icedir + "/tmap_L" + std::to_string(L) + ".txt";
+        if (!read_3dice_tmap(path, ice) || (int)ice.size() != ny || (int)ice[0].size() != nx) {
+            printf("  %s: missing, or not %d rows x %d columns\n", path.c_str(), ny, nx);
+            ++failures;
+            continue;
+        }
+        // 3D-ICE writes row j = 0 (y = 0) first.
+        double maxd = 0, sumd = 0, ours_max = -1e30, ice_max = -1e30;
+        int wi = 0, wj = 0;
+        for (int j = 0; j < ny; ++j)
+            for (int i = 0; i < nx; ++i) {
+                double a = g.T[m.idx(i, j, plane)] + m.T_amb, b = ice[j][i] - 273.15;
+                double d = a - b;
+                sumd += d;
+                if (std::fabs(d) > maxd) { maxd = std::fabs(d); wi = i; wj = j; }
+                ours_max = std::max(ours_max, a);
+                ice_max = std::max(ice_max, b);
+            }
+        printf("\n  %s (whole map, %d cells):\n", cs.layers[L].name.c_str(), nx * ny);
+        printf("    hottest cell: ours %.3f C, 3D-ICE %.3f C\n", ours_max, ice_max);
+        printf("    max |difference| = %.4f C at x = %.2f mm, y = %.2f mm; mean difference %+.4f C\n",
+               maxd, (wi + 0.5) * m.dx * 1e3, (wj + 0.5) * m.dy * 1e3, sumd / (nx * ny));
+
+        std::vector<std::string> nmax, navg;
+        std::vector<double> vmax, vavg;
+        bool okf = read_3dice_tflp(icedir + "/tflp_max_L" + std::to_string(L) + ".txt", nmax, vmax) &&
+                   read_3dice_tflp(icedir + "/tflp_avg_L" + std::to_string(L) + ".txt", navg, vavg);
+        if (!okf) { printf("    (no Tflp files)\n"); continue; }
+        printf("    %-14s %10s %10s %8s %10s %10s %8s\n", "block", "max ours", "max 3DICE", "diff",
+               "avg ours", "avg 3DICE", "diff");
+        for (const PowerBlock& b : cs.blocks) {
+            if ((size_t)b.layer != L) continue;
+            std::string nm = ice_name(b.name);
+            size_t k = std::find(nmax.begin(), nmax.end(), nm) - nmax.begin();
+            size_t a = std::find(navg.begin(), navg.end(), nm) - navg.begin();
+            if (k >= vmax.size() || a >= vavg.size()) continue;
+            double tmax, tavg;
+            block_temps(m, g.T, b, tmax, tavg);
+            tmax += m.T_amb;
+            tavg += m.T_amb;
+            double imax = vmax[k] - 273.15, iavg = vavg[a] - 273.15;
+            printf("    %-14s %10.3f %10.3f %+8.4f %10.3f %10.3f %+8.4f\n", b.name.c_str(), tmax, imax,
+                   tmax - imax, tavg, iavg, tavg - iavg);
+        }
+    }
+    return failures ? 1 : 0;
+}
+
 // Time at which T_max first reaches `frac` of its steady value, interpolated
 // linearly between steps. Returns -1 if never reached.
 static double time_to(const std::vector<StepRecord>& steps, double target) {
@@ -466,6 +582,10 @@ static void benchmark(int n) {
 }
 
 int main(int argc, char** argv) {
+    if (argc >= 5 && strcmp(argv[1], "export3dice") == 0)
+        return export_case_3dice(argv[2], atof(argv[3]), argv[4]);
+    if (argc >= 5 && strcmp(argv[1], "compare3dice") == 0)
+        return compare_case_3dice(argv[2], atof(argv[3]), argv[4]);
     if (argc >= 3 && strcmp(argv[1], "case") == 0) {
         return run_case(argv[2], argc >= 4 ? atoi(argv[3]) : 200);
     }

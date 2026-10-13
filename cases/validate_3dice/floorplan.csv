@@ -1,0 +1,15 @@
+# Same power map as cases/example. 3D-ICE needs disjoint blocks, so the DRAM die is split
+# into 4 bank regions around the controller, all at the banks' 0.12 W/mm^2, and the
+# controller carries its own 3 W plus the bank power under it (0.48 W).
+name, layer, x_mm, y_mm, w_mm, h_mm, power_W
+core0, Si tier 2 (bottom), 0.5, 0.5, 2.0, 2.0, 6
+core1, Si tier 2 (bottom), 3.0, 0.5, 2.0, 2.0, 6
+core2, Si tier 2 (bottom), 0.5, 3.0, 2.0, 2.0, 6
+core3, Si tier 2 (bottom), 3.0, 3.0, 2.0, 2.0, 6
+l2_cache, Si tier 2 (bottom), 5.5, 0.5, 4.0, 4.5, 3
+noc_io, Si tier 2 (bottom), 0.5, 5.5, 9.0, 4.0, 3
+dram_banks_s, Si tier 1 (top), 0.0, 0.0, 10.0, 4.0, 4.8
+dram_banks_n, Si tier 1 (top), 0.0, 6.0, 10.0, 4.0, 4.8
+dram_banks_w, Si tier 1 (top), 0.0, 4.0, 4.0, 2.0, 0.96
+dram_banks_e, Si tier 1 (top), 6.0, 4.0, 4.0, 2.0, 0.96
+dram_ctrl, Si tier 1 (top), 4.0, 4.0, 2.0, 2.0, 3.48

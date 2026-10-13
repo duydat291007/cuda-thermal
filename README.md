@@ -2,7 +2,8 @@
 
 GPU thermal solver for 3D-stacked ICs, written in CUDA C++.
 
-**Current milestone:** temperature of a layered 3D chip stack with real
+**Current milestone:** validated against 3D-ICE to its output precision
+(0.0005 C). Solves the temperature of a layered 3D chip stack with real
 floorplans and TSVs, steady state and transient (heat-up after power-on), solved
 with a matrix-free preconditioned conjugate gradient (PCG) method on the CPU
 (reference) and the GPU, with a geometric multigrid preconditioner.
@@ -107,6 +108,41 @@ core0 they cool it by ~6.6 C, by bypassing the 10 um bond layer (k = 2) that
 otherwise drops ~7.5 K at that power density, while warming the DRAM above by
 0.2 C.
 
+## Validation against 3D-ICE
+[3D-ICE](https://github.com/esl-epfl/3d-ice) (EPFL) is an established 3D-IC
+thermal simulator. `thermal3d export3dice` writes a case in its input format on
+the same grid (each of our planes becomes a 3D-ICE layer, each active layer a die),
+and `thermal3d compare3dice` solves the case here and compares cell by cell.
+
+`cases/validate_3dice` is the example stack set up so both tools solve the same
+discrete problem: 1 plane per active layer (3D-ICE puts a die's power in one
+source layer) and disjoint power blocks (3D-ICE requires them). Results:
+
+| grid | max difference, both full dies | every block max / avg | 3D-ICE time, memory |
+|---|---|---|---|
+| 100 x 100 x 9 | 0.0005 C | within 0.0005 C | 6.6 s, 0.5 GB |
+| 200 x 200 x 9 | 0.0005 C | within 0.0005 C | 66 s, 2.7 GB |
+
+0.0005 C is the rounding of 3D-ICE's output (3 decimals), so the two agree to the
+last digit it prints. (3D-ICE timings on a 2-core cloud machine with its
+default single-threaded direct solver; ours solves the 200 x 200 case in ~30 ms on
+an RTX 4060.)
+
+One modeling difference was found and quantified: 3D-ICE couples the *bottom*
+layer of the stack to its neighbor with its full height instead of half (its node
+sits on the adiabatic bottom face). Without the 1 um base layer in
+`validate_3dice`, 3D-ICE runs 0.25 C hotter under core0, as expected from that
+extra half layer of silicon under 150 W/cm^2. The comparison also caught a bug
+here: block statistics counted cells that only touched a block's edge (a ~1e-16
+rounding overlap), inflating two block maxima by 0.5-0.7 C.
+
+Building 3D-ICE (Ubuntu / WSL):
+```
+sudo apt install -y build-essential git unzip bison flex libopenblas-dev
+git clone https://github.com/esl-epfl/3d-ice.git && cd 3d-ice
+bash install-superlumt.sh && make -j8
+```
+
 ## Build and run (x64 Native Tools Command Prompt)
 ```
 build.bat            # debug build, SYNC_CHECK=1
@@ -118,6 +154,10 @@ thermal3d.exe transient 400   # same on a finer grid
 thermal3d.exe transient 200 jacobi   # same with the Jacobi preconditioner
 thermal3d.exe case cases\example 200          # block temperatures, TSV effect, heat maps
 thermal3d.exe case cases\tsv_under_core0 200
+mkdir cases\validate_3dice\ice100
+thermal3d.exe export3dice cases\validate_3dice 100 cases\validate_3dice\ice100
+   (run 3D-ICE-Emulator case.stk in that folder, from WSL)
+thermal3d.exe compare3dice cases\validate_3dice 100 cases\validate_3dice\ice100
 thermal3d_float.exe 800   # the float version, to see the precision failure
 ```
 CMake alternative:
@@ -131,7 +171,7 @@ cmake --build build --config Release
 |---|---|
 | `src/stack3d.h` | Layers, per-cell materials, TSVs, face conductances, power blocks, energy balance |
 | `src/operator3d.h` | 7-point per-face operator shared by CPU, GPU and all multigrid levels |
-| `src/case3d.h` | Case loader (stack / floorplan / TSV CSV files) and the built-in example |
+| `src/case3d.h` | Case loader (stack / floorplan / TSV CSV files), built-in example, 3D-ICE export |
 | `cases/` | Example cases |
 | `src/pcg3d.h` | Solver interface: `CpuPcg` and `GpuPcg` objects, preconditioner choice |
 | `src/mg3d.h` | Multigrid: level geometry, column (line) smoother, coarse operators |
@@ -151,5 +191,6 @@ cmake --build build --config Release
 5. ~~Multigrid preconditioner~~, ~~profiled and optimized~~, ~~float V-cycle in
    double PCG~~. Next for speed: pinned host memory, keep PCG scalars on
    the GPU, batch the small coarse-level launches (CUDA graphs)
-6. ~~Power maps from files, TSVs (per-cell anisotropic materials)~~ (here)
-7. Validate and benchmark against 3D-ICE
+6. ~~Power maps from files, TSVs (per-cell anisotropic materials)~~
+7. ~~Validate against 3D-ICE~~ (here): agreement to its output precision.
+   Next: validate TSV regions too (3D-ICE 4.0 heterogeneous floorplans)

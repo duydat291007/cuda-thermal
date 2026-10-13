@@ -184,7 +184,9 @@ void for_each_overlap(const Model3D& m, double x0, double y0, double w, double h
         for (int i = i0; i <= i1; ++i) {
             double a = overlap(i * m.dx, (i + 1) * m.dx, x0, x0 + w) *
                        overlap(j * m.dy, (j + 1) * m.dy, y0, y0 + h);
-            if (a > 0) fn((size_t)j * m.nx + i, a / (m.dx * m.dy));
+            // Rounding gives a cell that only touches the edge a tiny positive
+            // overlap (~1e-16 of a cell); don't count it as covered.
+            if (a > 1e-9 * m.dx * m.dy) fn((size_t)j * m.nx + i, a / (m.dx * m.dy));
         }
 }
 

@@ -8,3 +8,4 @@ transient.csv
 *.nsys-rep
 *.sqlite
 tmap_*.csv
+cases/*/ice*/
