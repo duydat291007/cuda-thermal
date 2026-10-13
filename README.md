@@ -2,17 +2,47 @@
 
 GPU thermal solver for 3D-stacked ICs, written in CUDA C++.
 
-**Current milestone:** validated against 3D-ICE to its output precision
-(0.0005 C), including TSV regions. Solves the temperature of a layered 3D chip stack with real
-floorplans and TSVs, steady state and transient (heat-up after power-on), solved
-with a matrix-free preconditioned conjugate gradient (PCG) method on the CPU
-(reference) and the GPU, with a geometric multigrid preconditioner.
+Solves the temperature of a layered 3D chip stack with real floorplans and TSVs,
+steady state and transient (heat-up after power-on), with a matrix-free
+preconditioned conjugate gradient (PCG) method and a geometric multigrid
+preconditioner, on the GPU (and on the CPU as a reference). Validated against
+3D-ICE to its output precision (0.0005 C), including TSV regions; optimized with
+Nsight Systems / Nsight Compute; and viewable live, with CUDA-OpenGL interop.
+
+![Live viewer: logic die (left) and memory die (right) of a two-tier stack](docs/viewer.png)
 
 ## Programs
 | Program | What it solves |
 |---|---|
 | `thermal3d` | 3D layered stack: per-layer conductivity, heat sink on top, power maps with hotspots |
+| `thermal3d_view` | Live view: the stack heats up on screen while you switch blocks on and off |
 | `thermal2d` | 2D model problem used to learn stencil kernels (Jacobi, naive vs shared-memory tiled) |
+
+## Live viewer
+`thermal3d_view [case folder] [n]` (default: the built-in example, 256 x 256 x 10)
+shows the active dies side by side, bottom die on the left. Every frame runs one
+backward Euler step on the GPU (multigrid PCG, warm-started: 1-4 iterations,
+1.6-3.3 ms on an RTX 4060 laptop GPU at 60 fps), a kernel maps the temperatures
+to colors and finds each die's hottest cell (one 64-bit atomic max of
+temperature bits and cell index), and CUDA-OpenGL interop copies the colors
+straight into the OpenGL textures: the temperature field never leaves the GPU.
+The program asks laptop drivers for the NVIDIA GPU (`NvOptimusEnablement`) so
+OpenGL and CUDA share a device; without interop it falls back to a host copy.
+
+Controls: **1-9** switch floorplan blocks on / off; **left click** adds a 2 W
+hotspot on the die you click, **right click** clears that die's hotspots;
+**+ / -** simulation speed; **space** pause; **R** reset to ambient; **Esc** quit.
+A cross marks each die's hottest cell; the triangles on the color bar show each
+die's maximum, in the color of its frame.
+
+What it shows on the example stack: switching off the memory die's 12 W cools
+the logic die below it too (hottest core 73.0 -> 66.1 C), since both share one
+heat-sink path, and the memory die's hottest spot sits above the logic die's
+hottest core, not at its own controller.
+
+Building it needs GLFW ("64-bit Windows binaries" from glfw.org), unpacked to
+`C:\libs\glfw-3.5.1.bin.WIN64` or wherever `GLFW_DIR` points; `build.bat` skips
+the viewer if GLFW isn't found. OpenGL itself comes with Windows.
 
 ## The 3D model
 A two-tier stack on a 10 mm x 10 mm footprint, bottom to top:
@@ -220,6 +250,7 @@ mkdir cases\validate_3dice\ice100
 thermal3d.exe export3dice cases\validate_3dice 100 cases\validate_3dice\ice100
    (run 3D-ICE-Emulator case.stk in that folder, from WSL)
 thermal3d.exe profile 800      # one multigrid solve only, for nsys / ncu
+thermal3d_view.exe             # live viewer (needs GLFW, see above)
 thermal3d.exe compare3dice cases\validate_3dice 100 cases\validate_3dice\ice100
    (same three steps with cases\validate_tsv to validate the TSV regions)
 thermal3d_float.exe 800   # the float version, to see the precision failure
@@ -243,6 +274,7 @@ cmake --build build --config Release
 | `src/pcg3d_gpu.cu` | GPU PCG and multigrid: stencil, smoother, transfer and reduction kernels, device scalars, CUDA graphs |
 | `src/transient3d.h` | Backward Euler time stepping, works with either solver |
 | `src/main3d.cu` | 3D verification and benchmark driver |
+| `src/viewer.cu` | Live viewer: GLFW window, colors and hottest cell on the GPU, CUDA-OpenGL interop |
 | `src/cuda_check.h` | `CUDA_CHECK` and `KERNEL_CHECK` macros |
 | `src/problem.h`, `src/*jacobi*`, `src/main.cu` | 2D Jacobi model problem |
 
@@ -257,5 +289,7 @@ cmake --build build --config Release
    driven: FP64 diagonal, color-split multigrid layout~~, ~~multigrid setup on
    the GPU~~
 6. ~~Power maps from files, TSVs (per-cell anisotropic materials)~~
-7. ~~Validate against 3D-ICE~~, ~~including TSV regions~~ (here): agreement to
-   its output precision
+7. ~~Validate against 3D-ICE~~, ~~including TSV regions~~: agreement to its
+   output precision
+8. ~~Live viewer with CUDA-OpenGL interop~~ (here). Next ideas: switch blocks
+   from an FPGA board over UART; temperature-dependent conductivity

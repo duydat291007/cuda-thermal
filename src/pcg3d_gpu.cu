@@ -535,6 +535,16 @@ void GpuPcg::set_rhs_transient() {
     KERNEL_CHECK();
 }
 
+void GpuPcg::set_power(const std::vector<double>& P) {
+    CUDA_CHECK(cudaStreamSynchronize(s_));  // the previous P may still be in use
+    if constexpr (std::is_same<Real, double>::value) {
+        CUDA_CHECK(cudaMemcpy(P_, P.data(), n_ * sizeof(Real), cudaMemcpyHostToDevice));
+    } else {
+        std::vector<Real> Pr = to_real(P);
+        CUDA_CHECK(cudaMemcpy(P_, Pr.data(), n_ * sizeof(Real), cudaMemcpyHostToDevice));
+    }
+}
+
 void GpuPcg::get_x(std::vector<Real>& T) const {
     T.resize(n_);
     CUDA_CHECK(cudaMemcpyAsync(T.data(), x_, n_ * sizeof(Real), cudaMemcpyDeviceToHost, s_));

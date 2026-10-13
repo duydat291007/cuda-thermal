@@ -124,6 +124,10 @@ public:
     void set_rhs_transient();
     PcgStats solve(double tol, int maxit);
     void get_x(std::vector<Real>& T) const;
+    // For live use (viewer): replace the power map (W per cell, same model),
+    // and read the temperature rise where it lives, on the GPU (natural layout).
+    void set_power(const std::vector<double>& P);
+    const Real* device_x() const { return x_; }
 
 private:
     void vcycle(size_t level);           // multigrid only; level 0 b must hold r

@@ -9,3 +9,4 @@ transient.csv
 *.sqlite
 tmap_*.csv
 cases/*/ice*/
+*.dll

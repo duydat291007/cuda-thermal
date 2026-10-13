@@ -26,3 +26,12 @@ add_executable(thermal3d_float
     src/pcg3d_gpu.cu
     src/pcg3d_cpu.cpp)
 target_compile_definitions(thermal3d_float PRIVATE SYNC_CHECK=${SYNC_CHECK} REAL_FLOAT)
+
+# Live viewer: configure with -DGLFW_DIR=C:/libs/glfw-3.5.1.bin.WIN64 to build it.
+if(DEFINED GLFW_DIR)
+    add_executable(thermal3d_view src/viewer.cu src/pcg3d_gpu.cu src/pcg3d_cpu.cpp)
+    target_compile_definitions(thermal3d_view PRIVATE SYNC_CHECK=${SYNC_CHECK} GLFW_DLL)
+    target_include_directories(thermal3d_view PRIVATE ${GLFW_DIR}/include)
+    target_link_directories(thermal3d_view PRIVATE ${GLFW_DIR}/lib-vc2026 ${GLFW_DIR}/lib-vc2022)
+    target_link_libraries(thermal3d_view PRIVATE glfw3dll opengl32)
+endif()
