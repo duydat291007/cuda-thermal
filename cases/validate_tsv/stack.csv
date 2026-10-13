@@ -1,0 +1,15 @@
+# TSV validation against 3D-ICE: cases/validate_3dice plus tsv.csv. Discretized so both tools solve
+# the same problem. Each active layer is 1 plane (3D-ICE puts a die's power in one source
+# layer), and a thin unpowered base layer sits at the bottom: 3D-ICE couples the bottom
+# layer to its neighbor with its full height instead of half, which this makes negligible.
+# die_mm, 10, 10
+# h_top, 2e4
+# h_bottom, 0
+# ambient_C, 25
+name, thickness_um, k_W_per_mK, rho_c_J_per_m3K, planes, active
+base, 1, 130, 1.66e6, 1, 0
+Si tier 2 (bottom), 50, 130, 1.66e6, 1, 1
+bond + BEOL, 10, 2, 1.70e6, 1, 0
+Si tier 1 (top), 50, 130, 1.66e6, 1, 1
+TIM, 25, 5, 2.00e6, 1, 0
+Cu spreader, 1000, 400, 3.45e6, 4, 0

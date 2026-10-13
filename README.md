@@ -3,7 +3,7 @@
 GPU thermal solver for 3D-stacked ICs, written in CUDA C++.
 
 **Current milestone:** validated against 3D-ICE to its output precision
-(0.0005 C). Solves the temperature of a layered 3D chip stack with real
+(0.0005 C), including TSV regions. Solves the temperature of a layered 3D chip stack with real
 floorplans and TSVs, steady state and transient (heat-up after power-on), solved
 with a matrix-free preconditioned conjugate gradient (PCG) method on the CPU
 (reference) and the GPU, with a geometric multigrid preconditioner.
@@ -128,6 +128,17 @@ last digit it prints. (3D-ICE timings on a 2-core cloud machine with its
 default single-threaded direct solver; ours solves the 200 x 200 case in ~30 ms on
 an RTX 4060.)
 
+**TSVs.** 3D-ICE 4.0 can give a layer a layout file of rectangles made of other
+(anisotropic) materials. The exporter writes one material per distinct TSV
+fraction, with the same effective kxy, kz and rho*c as our model, and every TSV
+cell as a rectangle, so partially covered cells and overlapping regions carry over
+exactly. `cases/validate_tsv` adds three TSV regions to the bond layer: dense TSVs
+under core0, and two crossing strips between the cores that don't line up with the
+100 um cells. Result at 100 x 100 x 9: max difference 0.0005 C on both dies, every
+block within 0.0005 C, and both tools show the TSVs cooling core0 from 73.98 C to
+67.54 C. Limitation: 3D-ICE can't put materials in a die's source layer, so TSVs
+can only be validated in inactive layers (the exporter refuses others).
+
 One modeling difference was found and quantified: 3D-ICE couples the *bottom*
 layer of the stack to its neighbor with its full height instead of half (its node
 sits on the adiabatic bottom face). Without the 1 um base layer in
@@ -158,6 +169,7 @@ mkdir cases\validate_3dice\ice100
 thermal3d.exe export3dice cases\validate_3dice 100 cases\validate_3dice\ice100
    (run 3D-ICE-Emulator case.stk in that folder, from WSL)
 thermal3d.exe compare3dice cases\validate_3dice 100 cases\validate_3dice\ice100
+   (same three steps with cases\validate_tsv to validate the TSV regions)
 thermal3d_float.exe 800   # the float version, to see the precision failure
 ```
 CMake alternative:
@@ -192,5 +204,5 @@ cmake --build build --config Release
    double PCG~~. Next for speed: pinned host memory, keep PCG scalars on
    the GPU, batch the small coarse-level launches (CUDA graphs)
 6. ~~Power maps from files, TSVs (per-cell anisotropic materials)~~
-7. ~~Validate against 3D-ICE~~ (here): agreement to its output precision.
-   Next: validate TSV regions too (3D-ICE 4.0 heterogeneous floorplans)
+7. ~~Validate against 3D-ICE~~, ~~including TSV regions~~ (here): agreement to
+   its output precision

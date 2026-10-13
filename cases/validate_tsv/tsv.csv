@@ -1,0 +1,8 @@
+# TSVs through the bond layer, checked against 3D-ICE layout materials. 3D-ICE can't
+# put materials in a die's source layer, so these sit only in the (inactive) bond layer.
+# Under core0: dense thermal TSVs. Strips between the cores: not aligned to 100 um cells
+# and crossing each other, so partially covered cells and overlaps are tested too.
+layer, x_mm, y_mm, w_mm, h_mm, cu_fraction
+bond + BEOL, 0.5, 0.5, 2.0, 2.0, 0.15
+bond + BEOL, 2.55, 0.5, 0.40, 4.5, 0.15
+bond + BEOL, 0.5, 2.55, 4.5, 0.40, 0.15
